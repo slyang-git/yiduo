@@ -8,6 +8,8 @@ Device sync agent for AI Wrapped.
 curl -fsSL https://github.com/slyang-git/yiduo/releases/latest/download/install.sh | bash
 ```
 
+The binary is installed to `~/.local/bin` by default. Override with `YIDUO_INSTALL_DIR`.
+
 Install a specific version:
 
 ```sh
