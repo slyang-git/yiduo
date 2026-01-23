@@ -34,7 +34,16 @@ jobs:
           tar -czf "dist/${BIN_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C dist "${BIN_NAME}"
           rm -f "dist/${BIN_NAME}"
 
+      - name: Prepare install script
+        run: |
+          set -euo pipefail
+          cp install.sh dist/install.sh
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/install.sh
+          fail_on_unmatched_files: true
+          tag_name: ${{ github.ref_name }}
