@@ -1,0 +1,1847 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type SyncPayload struct {
+	AgentID  string        `json:"agent_id"`
+	Tool     string        `json:"tool"`
+	Host     string        `json:"host"`
+	Sessions []SyncSession `json:"sessions"`
+}
+
+type SyncSession struct {
+	ID                     string        `json:"id"`
+	Title                  string        `json:"title"`
+	Model                  string        `json:"model"`
+	Cwd                    string        `json:"cwd"`
+	StartedAt              string        `json:"started_at"`
+	EndedAt                string        `json:"ended_at"`
+	TotalTokens            int           `json:"total_tokens"`
+	TotalInputTokens       int           `json:"total_input_tokens"`
+	TotalOutputTokens      int           `json:"total_output_tokens"`
+	TotalCachedInputTokens int           `json:"total_cached_input_tokens"`
+	TotalReasoningTokens   int           `json:"total_reasoning_tokens"`
+	Messages               []SyncMessage `json:"messages"`
+}
+
+type SyncMessage struct {
+	Index     int    `json:"index"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp"`
+}
+
+type tokenTotals struct {
+	totalTokens           int
+	inputTokens           int
+	outputTokens          int
+	cachedInputTokens     int
+	reasoningOutputTokens int
+}
+
+func main() {
+	server := flag.String("server", envOrDefault("AI_WRAPPED_SERVER", "http://localhost:8000"), "API server base URL")
+	tool := flag.String("tool", "", "tool name override")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|antigravity|droid (comma-separated)")
+	deviceToken := flag.String("device-token", envOrDefault("AI_WRAPPED_DEVICE_TOKEN", ""), "device token for sync authentication")
+	codexRoot := flag.String("codex-root", envOrDefault("CODEX_ROOT", "~/.codex"), "Codex root")
+	claudeRoot := flag.String("claude-root", envOrDefault("CLAUDE_ROOT", "~/.claude"), "Claude Code root")
+	geminiRoot := flag.String("gemini-root", envOrDefault("GEMINI_ROOT", "~/.gemini"), "Gemini CLI root")
+	qwenRoot := flag.String("qwen-root", envOrDefault("QWEN_ROOT", "~/.qwen"), "Qwen root")
+	clineRoot := flag.String("cline-root", envOrDefault("CLINE_ROOT", "~/.cline"), "Cline root")
+	continueRoot := flag.String("continue-root", envOrDefault("CONTINUE_ROOT", "~/.continue"), "Continue root")
+	kiloRoot := flag.String("kilocode-root", envOrDefault("KILOCODE_ROOT", "~/.kilocode"), "KiloCode root")
+	cursorRoot := flag.String("cursor-root", envOrDefault("CURSOR_ROOT", "~/.cursor"), "Cursor root")
+	ampRoot := flag.String("amp-root", envOrDefault("AMP_ROOT", "~/.amp"), "Amp root")
+	opencodeRoot := flag.String("opencode-root", envOrDefault("OPENCODE_ROOT", "~/.opencode"), "OpenCode root")
+	antigravityRoot := flag.String("antigravity-root", envOrDefault("ANTIGRAVITY_ROOT", "~/.gemini/antigravity"), "Antigravity root")
+	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
+	agentID := flag.String("agent-id", "local", "agent id")
+	host := flag.String("host", hostname(), "host name")
+	flag.Parse()
+
+	sources, err := parseSources(*source)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid source: %v\n", err)
+		os.Exit(1)
+	}
+
+	toolOverride := strings.TrimSpace(*tool)
+	if toolOverride != "" && len(sources) > 1 {
+		fmt.Fprintln(os.Stderr, "tool override ignored when syncing multiple sources")
+		toolOverride = ""
+	}
+
+	totalSessions := 0
+	for _, sourceName := range sources {
+		toolName := defaultToolName(sourceName)
+		if toolOverride != "" {
+			toolName = toolOverride
+		}
+
+		var sessions []SyncSession
+		switch sourceName {
+		case "codex":
+			sessions, err = loadCodexSessions(expandUser(*codexRoot))
+		case "claude":
+			sessions, err = loadClaudeSessions(expandUser(*claudeRoot))
+		case "gemini":
+			sessions, err = loadGeminiSessions(expandUser(*geminiRoot))
+		case "qwen":
+			sessions, err = loadQwenSessions(expandUser(*qwenRoot))
+		case "cline":
+			sessions, err = loadClineSessions(expandUser(*clineRoot))
+		case "continue":
+			sessions, err = loadContinueSessions(expandUser(*continueRoot))
+		case "kilocode":
+			sessions, err = loadKiloCodeSessions(expandUser(*kiloRoot))
+		case "cursor":
+			sessions, err = loadCursorSessions(expandUser(*cursorRoot))
+		case "amp":
+			sessions, err = loadAmpSessions(expandUser(*ampRoot))
+		case "opencode":
+			sessions, err = loadOpenCodeSessions(expandUser(*opencodeRoot))
+		case "antigravity":
+			sessions, err = loadAntigravitySessions(expandUser(*antigravityRoot))
+		case "droid":
+			sessions, err = loadDroidSessions(expandUser(*droidRoot))
+		default:
+			fmt.Fprintf(os.Stderr, "unknown source: %s\n", sourceName)
+			os.Exit(1)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load %s sessions: %v\n", sourceName, err)
+			os.Exit(1)
+		}
+
+		payload := SyncPayload{
+			AgentID:  *agentID,
+			Tool:     toolName,
+			Host:     *host,
+			Sessions: sessions,
+		}
+
+		if err := syncPayload(*server, *deviceToken, payload); err != nil {
+			fmt.Fprintf(os.Stderr, "sync failed for %s: %v\n", sourceName, err)
+			os.Exit(1)
+		}
+
+		totalSessions += len(sessions)
+	}
+
+	if len(sources) == 1 {
+		fmt.Printf("Synced %d sessions to %s\n", totalSessions, *server)
+	} else {
+		fmt.Printf("Synced %d sessions across %d tools to %s\n", totalSessions, len(sources), *server)
+	}
+}
+
+func loadCodexSessions(root string) ([]SyncSession, error) {
+	sessionsDir := filepath.Join(root, "sessions")
+	entries, err := listJSONL(sessionsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]SyncSession, 0, len(entries))
+	for _, path := range entries {
+		session, ok := parseCodexSession(path)
+		if !ok {
+			continue
+		}
+		results = append(results, session)
+	}
+
+	return results, nil
+}
+
+func listJSONL(root string) ([]string, error) {
+	var paths []string
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return []string{}, nil
+	}
+
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".jsonl") {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func parseCodexSession(filePath string) (SyncSession, bool) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	defer file.Close()
+
+	stat, _ := file.Stat()
+	endedAt := ""
+	if stat != nil {
+		endedAt = stat.ModTime().Format(time.RFC3339)
+	}
+
+	var session SyncSession
+	session.EndedAt = endedAt
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lineIndex := 0
+	msgIndex := 0
+	var tokens tokenTotals
+
+	for scanner.Scan() {
+		lineText := strings.TrimSpace(scanner.Text())
+		if lineText == "" {
+			lineIndex++
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(lineText))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			lineIndex++
+			continue
+		}
+
+		typeValue := stringFrom(item["type"])
+		if lineIndex == 0 && typeValue == "session_meta" {
+			payload := mapFrom(item["payload"])
+			session.ID = stringFrom(payload["id"])
+			session.StartedAt = stringFrom(payload["timestamp"])
+			session.Title = firstStringFromMap(payload, "title", "name")
+			session.Cwd = firstStringFromMap(
+				payload,
+				"cwd",
+				"workspace",
+				"workspaceDirectory",
+				"workspace_directory",
+				"projectPath",
+				"project_path",
+				"repo_path",
+				"path",
+			)
+		}
+
+		if typeValue == "turn_context" {
+			payload := mapFrom(item["payload"])
+			model := stringFrom(payload["model"])
+			if model != "" {
+				session.Model = model
+			}
+		}
+
+		if typeValue == "event_msg" {
+			payload := mapFrom(item["payload"])
+			if stringFrom(payload["type"]) == "token_count" {
+				info := mapFrom(payload["info"])
+				total := mapFrom(info["total_token_usage"])
+				tokens.totalTokens = intFrom(total["total_tokens"], tokens.totalTokens)
+				tokens.inputTokens = intFrom(total["input_tokens"], tokens.inputTokens)
+				tokens.outputTokens = intFrom(total["output_tokens"], tokens.outputTokens)
+				tokens.cachedInputTokens = intFrom(total["cached_input_tokens"], tokens.cachedInputTokens)
+				tokens.reasoningOutputTokens = intFrom(total["reasoning_output_tokens"], tokens.reasoningOutputTokens)
+			}
+			lineIndex++
+			continue
+		}
+
+		if typeValue == "response_item" {
+			payload := mapFrom(item["payload"])
+			if stringFrom(payload["type"]) != "message" {
+				lineIndex++
+				continue
+			}
+			content := parseMessageContent(payload["content"])
+			if content != "" {
+				session.Messages = append(session.Messages, SyncMessage{
+					Index:   msgIndex,
+					Role:    stringFrom(payload["role"]),
+					Content: content,
+				})
+				msgIndex++
+			}
+		}
+		lineIndex++
+	}
+
+	session.TotalTokens = tokens.totalTokens
+	session.TotalInputTokens = tokens.inputTokens
+	session.TotalOutputTokens = tokens.outputTokens
+	session.TotalCachedInputTokens = tokens.cachedInputTokens
+	session.TotalReasoningTokens = tokens.reasoningOutputTokens
+
+	if session.ID == "" {
+		return SyncSession{}, false
+	}
+	if session.StartedAt == "" && endedAt != "" {
+		session.StartedAt = endedAt
+	}
+	if session.Cwd == "" {
+		for _, msg := range session.Messages {
+			if msg.Content == "" {
+				continue
+			}
+			if cwd := extractTaggedValue(msg.Content, "cwd"); cwd != "" {
+				session.Cwd = cwd
+				break
+			}
+			if cwd := extractWorkspaceDirectory(msg.Content); cwd != "" {
+				session.Cwd = cwd
+				break
+			}
+		}
+	}
+	session.Cwd = normalizeCwd(session.Cwd)
+	if session.Title == "" && session.Cwd != "" {
+		session.Title = session.Cwd
+	}
+
+	return session, true
+}
+
+type geminiSession struct {
+	SessionID   string          `json:"sessionId"`
+	ProjectHash string          `json:"projectHash"`
+	StartTime   string          `json:"startTime"`
+	LastUpdated string          `json:"lastUpdated"`
+	Messages    []geminiMessage `json:"messages"`
+}
+
+type geminiMessage struct {
+	ID        string        `json:"id"`
+	Timestamp string        `json:"timestamp"`
+	Type      string        `json:"type"`
+	Content   string        `json:"content"`
+	Model     string        `json:"model"`
+	Tokens    *geminiTokens `json:"tokens"`
+}
+
+type geminiTokens struct {
+	Input    int `json:"input"`
+	Output   int `json:"output"`
+	Cached   int `json:"cached"`
+	Thoughts int `json:"thoughts"`
+	Tool     int `json:"tool"`
+	Total    int `json:"total"`
+}
+
+type claudeIndex struct {
+	Entries []claudeEntry `json:"entries"`
+}
+
+type claudeEntry struct {
+	SessionID   string `json:"sessionId"`
+	FullPath    string `json:"fullPath"`
+	Created     string `json:"created"`
+	Modified    string `json:"modified"`
+	FirstPrompt string `json:"firstPrompt"`
+	ProjectPath string `json:"projectPath"`
+}
+
+func loadClaudeSessions(root string) ([]SyncSession, error) {
+	projectsDir := filepath.Join(root, "projects")
+	info, err := os.Stat(projectsDir)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	indexPaths, err := findClaudeIndexes(projectsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []SyncSession
+	for _, indexPath := range indexPaths {
+		items, err := parseClaudeIndex(indexPath)
+		if err != nil {
+			continue
+		}
+		for _, entry := range items {
+			if entry.SessionID == "" || entry.FullPath == "" {
+				continue
+			}
+			session := SyncSession{
+				ID:        entry.SessionID,
+				Title:     entry.FirstPrompt,
+				Cwd:       entry.ProjectPath,
+				StartedAt: entry.Created,
+				EndedAt:   entry.Modified,
+			}
+			if ok := parseClaudeSession(entry.FullPath, &session); !ok {
+				continue
+			}
+			sessions = append(sessions, session)
+		}
+	}
+
+	return sessions, nil
+}
+
+func findClaudeIndexes(projectsDir string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if d.Name() == "sessions-index.json" {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func parseClaudeIndex(path string) ([]claudeEntry, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var idx claudeIndex
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return nil, err
+	}
+	return idx.Entries, nil
+}
+
+func parseClaudeSession(filePath string, session *SyncSession) bool {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	msgIndex := 0
+	for scanner.Scan() {
+		lineText := strings.TrimSpace(scanner.Text())
+		if lineText == "" {
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(lineText))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			continue
+		}
+
+		typeValue := stringFrom(item["type"])
+		if typeValue != "user" && typeValue != "assistant" {
+			continue
+		}
+		message := mapFrom(item["message"])
+		role := stringFrom(message["role"])
+		if role == "" {
+			role = typeValue
+		}
+		content := parseClaudeContent(message["content"])
+		if content == "" {
+			continue
+		}
+		timestamp := stringFrom(item["timestamp"])
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:     msgIndex,
+			Role:      role,
+			Content:   content,
+			Timestamp: timestamp,
+		})
+		msgIndex++
+
+		if typeValue == "assistant" {
+			model := stringFrom(message["model"])
+			if model != "" {
+				session.Model = model
+			}
+			usage := mapFrom(message["usage"])
+			session.TotalInputTokens += intFrom(usage["input_tokens"], 0)
+			session.TotalOutputTokens += intFrom(usage["output_tokens"], 0)
+			session.TotalCachedInputTokens += intFrom(usage["cache_read_input_tokens"], 0)
+			session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
+		}
+	}
+
+	return session.ID != ""
+}
+
+func loadGeminiSessions(root string) ([]SyncSession, error) {
+	tmpDir := filepath.Join(root, "tmp")
+	info, err := os.Stat(tmpDir)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	sessionFiles, err := findGeminiSessions(tmpDir)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]SyncSession, 0, len(sessionFiles))
+	for _, path := range sessionFiles {
+		session, ok := parseGeminiSession(path)
+		if !ok {
+			continue
+		}
+		results = append(results, session)
+	}
+	return results, nil
+}
+
+func findGeminiSessions(tmpDir string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(tmpDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, "session-") && strings.HasSuffix(name, ".json") &&
+			strings.Contains(path, string(filepath.Separator)+"chats"+string(filepath.Separator)) {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func parseGeminiSession(path string) (SyncSession, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	var sess geminiSession
+	if err := json.Unmarshal(raw, &sess); err != nil {
+		return SyncSession{}, false
+	}
+	if sess.SessionID == "" {
+		return SyncSession{}, false
+	}
+
+	startedAt := sess.StartTime
+	endedAt := sess.LastUpdated
+	if endedAt == "" {
+		if stat, err := os.Stat(path); err == nil {
+			endedAt = stat.ModTime().Format(time.RFC3339)
+		}
+	}
+
+	session := SyncSession{
+		ID:        sess.SessionID,
+		StartedAt: startedAt,
+		EndedAt:   endedAt,
+	}
+
+	msgIndex := 0
+	for _, msg := range sess.Messages {
+		role := geminiRole(msg.Type)
+		content := strings.TrimSpace(msg.Content)
+		if content != "" {
+			if session.Title == "" && role == "user" {
+				session.Title = content
+			}
+			session.Messages = append(session.Messages, SyncMessage{
+				Index:     msgIndex,
+				Role:      role,
+				Content:   content,
+				Timestamp: msg.Timestamp,
+			})
+			msgIndex++
+		}
+		if msg.Model != "" {
+			session.Model = msg.Model
+		}
+		if msg.Tokens != nil {
+			session.TotalInputTokens += msg.Tokens.Input
+			session.TotalOutputTokens += msg.Tokens.Output
+			session.TotalCachedInputTokens += msg.Tokens.Cached
+			session.TotalReasoningTokens += msg.Tokens.Thoughts
+			if msg.Tokens.Total > 0 {
+				session.TotalTokens += msg.Tokens.Total
+			} else {
+				session.TotalTokens += msg.Tokens.Input + msg.Tokens.Output
+			}
+		}
+		if session.StartedAt == "" && msg.Timestamp != "" {
+			session.StartedAt = msg.Timestamp
+		}
+		if session.EndedAt == "" && msg.Timestamp != "" {
+			session.EndedAt = msg.Timestamp
+		}
+	}
+
+	if session.Title == "" {
+		session.Title = "Gemini session"
+	}
+	if session.TotalTokens == 0 {
+		session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
+	}
+
+	return session, true
+}
+
+func geminiRole(value string) string {
+	switch value {
+	case "user":
+		return "user"
+	case "gemini", "assistant":
+		return "assistant"
+	default:
+		if value == "" {
+			return "assistant"
+		}
+		return value
+	}
+}
+
+type qwenLogItem struct {
+	SessionID string `json:"sessionId"`
+	MessageID int    `json:"messageId"`
+	Type      string `json:"type"`
+	Message   string `json:"message"`
+	Timestamp string `json:"timestamp"`
+}
+
+type qwenMessage struct {
+	MessageID int
+	Role      string
+	Content   string
+	Timestamp string
+}
+
+func loadQwenSessions(root string) ([]SyncSession, error) {
+	tmpDir := filepath.Join(root, "tmp")
+	info, err := os.Stat(tmpDir)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	logs, err := findQwenLogs(tmpDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []SyncSession
+	for _, path := range logs {
+		items, err := parseQwenLog(path)
+		if err != nil {
+			continue
+		}
+		sessions = append(sessions, items...)
+	}
+	return sessions, nil
+}
+
+func findQwenLogs(tmpDir string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(tmpDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if d.Name() == "logs.json" {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func parseQwenLog(path string) ([]SyncSession, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var items []qwenLogItem
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, err
+	}
+
+	type qwenBucket struct {
+		session   SyncSession
+		messages  []qwenMessage
+		startedAt time.Time
+		endedAt   time.Time
+	}
+
+	buckets := map[string]*qwenBucket{}
+	for _, item := range items {
+		if item.SessionID == "" {
+			continue
+		}
+		bucket, ok := buckets[item.SessionID]
+		if !ok {
+			bucket = &qwenBucket{
+				session: SyncSession{
+					ID: item.SessionID,
+				},
+			}
+			buckets[item.SessionID] = bucket
+		}
+
+		role := "user"
+		if item.Type != "" {
+			role = item.Type
+		}
+		content := strings.TrimSpace(item.Message)
+		if content != "" {
+			bucket.messages = append(bucket.messages, qwenMessage{
+				MessageID: item.MessageID,
+				Role:      role,
+				Content:   content,
+				Timestamp: item.Timestamp,
+			})
+			if bucket.session.Title == "" && role == "user" {
+				bucket.session.Title = content
+			}
+		}
+
+		if item.Timestamp != "" {
+			if ts, err := time.Parse(time.RFC3339, item.Timestamp); err == nil {
+				if bucket.startedAt.IsZero() || ts.Before(bucket.startedAt) {
+					bucket.startedAt = ts
+				}
+				if bucket.endedAt.IsZero() || ts.After(bucket.endedAt) {
+					bucket.endedAt = ts
+				}
+			}
+		}
+	}
+
+	var sessions []SyncSession
+	for _, bucket := range buckets {
+		sort.Slice(bucket.messages, func(i, j int) bool {
+			return bucket.messages[i].MessageID < bucket.messages[j].MessageID
+		})
+		for idx, msg := range bucket.messages {
+			bucket.session.Messages = append(bucket.session.Messages, SyncMessage{
+				Index:     idx,
+				Role:      msg.Role,
+				Content:   msg.Content,
+				Timestamp: msg.Timestamp,
+			})
+		}
+		if bucket.session.StartedAt == "" && !bucket.startedAt.IsZero() {
+			bucket.session.StartedAt = bucket.startedAt.Format(time.RFC3339)
+		}
+		if bucket.session.EndedAt == "" && !bucket.endedAt.IsZero() {
+			bucket.session.EndedAt = bucket.endedAt.Format(time.RFC3339)
+		}
+		if bucket.session.Title == "" {
+			bucket.session.Title = "Qwen session"
+		}
+		sessions = append(sessions, bucket.session)
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+	return sessions, nil
+}
+
+func loadClineSessions(root string) ([]SyncSession, error) {
+	path := filepath.Join(root, "data", "state", "taskHistory.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return []SyncSession{}, nil
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, err
+	}
+
+	var sessions []SyncSession
+	for _, item := range items {
+		id := stringFrom(item["ulid"])
+		if id == "" {
+			id = stringFrom(item["id"])
+		}
+		if id == "" {
+			continue
+		}
+		ts := int64From(item["ts"], 0)
+		startedAt := formatMillis(ts)
+		session := SyncSession{
+			ID:        id,
+			Title:     stringFrom(item["task"]),
+			Cwd:       stringFrom(item["cwdOnTaskInitialization"]),
+			StartedAt: startedAt,
+			EndedAt:   startedAt,
+			TotalInputTokens:       intFrom(item["tokensIn"], 0),
+			TotalOutputTokens:      intFrom(item["tokensOut"], 0),
+			TotalCachedInputTokens: intFrom(item["cacheReads"], 0),
+		}
+		session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
+		if session.Title == "" {
+			session.Title = "Cline task"
+		}
+		if session.Title != "" {
+			session.Messages = append(session.Messages, SyncMessage{
+				Index:     0,
+				Role:      "user",
+				Content:   session.Title,
+				Timestamp: startedAt,
+			})
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, nil
+}
+
+func loadContinueSessions(root string) ([]SyncSession, error) {
+	sessionsDir := filepath.Join(root, "sessions")
+	indexPath := filepath.Join(sessionsDir, "sessions.json")
+	index := map[string]map[string]any{}
+
+	if raw, err := os.ReadFile(indexPath); err == nil {
+		var items []map[string]any
+		if err := json.Unmarshal(raw, &items); err == nil {
+			for _, item := range items {
+				id := stringFrom(item["sessionId"])
+				if id != "" {
+					index[id] = item
+				}
+			}
+		}
+	}
+
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return []SyncSession{}, nil
+	}
+
+	var sessions []SyncSession
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || entry.Name() == "sessions.json" {
+			continue
+		}
+		path := filepath.Join(sessionsDir, entry.Name())
+		session, ok := parseContinueSession(path, index)
+		if ok {
+			sessions = append(sessions, session)
+		}
+	}
+	return sessions, nil
+}
+
+type continueHistory struct {
+	Message    map[string]any `json:"message"`
+	PromptLogs []map[string]any `json:"promptLogs"`
+}
+
+type continueSession struct {
+	SessionID          string           `json:"sessionId"`
+	Title              string           `json:"title"`
+	WorkspaceDirectory string           `json:"workspaceDirectory"`
+	History            []continueHistory `json:"history"`
+}
+
+func parseContinueSession(path string, index map[string]map[string]any) (SyncSession, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	var sess continueSession
+	if err := json.Unmarshal(raw, &sess); err != nil {
+		return SyncSession{}, false
+	}
+	if sess.SessionID == "" {
+		return SyncSession{}, false
+	}
+
+	var startedAt string
+	if meta, ok := index[sess.SessionID]; ok {
+		ts := int64From(meta["dateCreated"], 0)
+		startedAt = formatMillis(ts)
+		if sess.Title == "" {
+			sess.Title = stringFrom(meta["title"])
+		}
+		if sess.WorkspaceDirectory == "" {
+			sess.WorkspaceDirectory = stringFrom(meta["workspaceDirectory"])
+		}
+	}
+
+	endedAt := ""
+	if stat, err := os.Stat(path); err == nil {
+		endedAt = stat.ModTime().Format(time.RFC3339)
+	}
+
+	session := SyncSession{
+		ID:        sess.SessionID,
+		Title:     sess.Title,
+		Cwd:       strings.TrimPrefix(sess.WorkspaceDirectory, "file://"),
+		StartedAt: startedAt,
+		EndedAt:   endedAt,
+	}
+
+	msgIndex := 0
+	for _, entry := range sess.History {
+		role := stringFrom(entry.Message["role"])
+		content := parseContinueContent(entry.Message["content"])
+		if content == "" {
+			continue
+		}
+		if session.Title == "" && role == "user" {
+			session.Title = content
+		}
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:   msgIndex,
+			Role:    role,
+			Content: content,
+		})
+		msgIndex++
+
+		if session.Model == "" {
+			for _, log := range entry.PromptLogs {
+				model := stringFrom(log["modelTitle"])
+				if model != "" {
+					session.Model = model
+					break
+				}
+			}
+		}
+	}
+
+	if session.Title == "" {
+		session.Title = "Continue session"
+	}
+	if session.StartedAt == "" {
+		session.StartedAt = session.EndedAt
+	}
+
+	return session, true
+}
+
+func parseContinueContent(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			entry := mapFrom(item)
+			if text := stringFrom(entry["text"]); text != "" {
+				parts = append(parts, text)
+				continue
+			}
+			if entryType := stringFrom(entry["type"]); entryType == "text" {
+				if text := stringFrom(entry["text"]); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	default:
+		return ""
+	}
+}
+
+type kiloUiMessage struct {
+	Ts   int64  `json:"ts"`
+	Type string `json:"type"`
+	Say  string `json:"say"`
+	Ask  string `json:"ask"`
+	Text string `json:"text"`
+}
+
+type kiloUsage struct {
+	TokensIn   int     `json:"tokensIn"`
+	TokensOut  int     `json:"tokensOut"`
+	CacheReads int     `json:"cacheReads"`
+	CacheWrites int    `json:"cacheWrites"`
+	Cost       float64 `json:"cost"`
+}
+
+func loadKiloCodeSessions(root string) ([]SyncSession, error) {
+	tasksDir := filepath.Join(root, "cli", "global", "tasks")
+	info, err := os.Stat(tasksDir)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	entries, err := os.ReadDir(tasksDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []SyncSession
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		taskDir := filepath.Join(tasksDir, entry.Name())
+		session, ok := parseKiloTask(taskDir, entry.Name())
+		if ok {
+			sessions = append(sessions, session)
+		}
+	}
+	return sessions, nil
+}
+
+func parseKiloTask(taskDir string, fallbackID string) (SyncSession, bool) {
+	uiPath := filepath.Join(taskDir, "ui_messages.json")
+	apiPath := filepath.Join(taskDir, "api_conversation_history.json")
+
+	var uiMessages []kiloUiMessage
+	if raw, err := os.ReadFile(uiPath); err == nil {
+		_ = json.Unmarshal(raw, &uiMessages)
+	}
+
+	var tokens tokenTotals
+	var startedMs int64
+	var endedMs int64
+	for _, msg := range uiMessages {
+		if startedMs == 0 || msg.Ts < startedMs {
+			startedMs = msg.Ts
+		}
+		if endedMs == 0 || msg.Ts > endedMs {
+			endedMs = msg.Ts
+		}
+		if msg.Say == "api_req_started" && msg.Text != "" {
+			var usage kiloUsage
+			if err := json.Unmarshal([]byte(msg.Text), &usage); err == nil {
+				tokens.inputTokens += usage.TokensIn
+				tokens.outputTokens += usage.TokensOut
+				tokens.cachedInputTokens += usage.CacheReads
+			}
+		}
+	}
+	tokens.totalTokens = tokens.inputTokens + tokens.outputTokens
+
+	var messages []SyncMessage
+	var title string
+	var model string
+	var cwd string
+
+	if raw, err := os.ReadFile(apiPath); err == nil {
+		var entries []map[string]any
+		if err := json.Unmarshal(raw, &entries); err == nil {
+			msgIndex := 0
+			for _, entry := range entries {
+				role := stringFrom(entry["role"])
+				contentList, _ := entry["content"].([]any)
+				content := parseKiloContentList(contentList)
+				ts := int64From(entry["ts"], 0)
+				if startedMs == 0 || ts < startedMs {
+					startedMs = ts
+				}
+				if endedMs == 0 || ts > endedMs {
+					endedMs = ts
+				}
+				if model == "" {
+					model = extractTaggedValue(content, "model")
+				}
+				if cwd == "" {
+					cwd = extractWorkspaceDirectory(content)
+				}
+				if content == "" {
+					continue
+				}
+				if title == "" && role == "user" {
+					title = content
+				}
+				messages = append(messages, SyncMessage{
+					Index:     msgIndex,
+					Role:      role,
+					Content:   content,
+					Timestamp: formatMillis(ts),
+				})
+				msgIndex++
+			}
+		}
+	}
+
+	if len(messages) == 0 && len(uiMessages) > 0 {
+		msgIndex := 0
+		for _, entry := range uiMessages {
+			if entry.Say != "text" || entry.Text == "" {
+				continue
+			}
+			if title == "" {
+				title = entry.Text
+			}
+			messages = append(messages, SyncMessage{
+				Index:     msgIndex,
+				Role:      "user",
+				Content:   entry.Text,
+				Timestamp: formatMillis(entry.Ts),
+			})
+			msgIndex++
+		}
+	}
+
+	id := fallbackID
+	if id == "" {
+		id = strconv.FormatInt(startedMs, 10)
+	}
+
+	session := SyncSession{
+		ID:                     id,
+		Title:                  title,
+		Model:                  model,
+		Cwd:                    cwd,
+		StartedAt:              formatMillis(startedMs),
+		EndedAt:                formatMillis(endedMs),
+		TotalTokens:            tokens.totalTokens,
+		TotalInputTokens:       tokens.inputTokens,
+		TotalOutputTokens:      tokens.outputTokens,
+		TotalCachedInputTokens: tokens.cachedInputTokens,
+		Messages:               messages,
+	}
+	if session.Title == "" {
+		session.Title = "KiloCode session"
+	}
+	if session.StartedAt == "" {
+		session.StartedAt = session.EndedAt
+	}
+	return session, session.ID != ""
+}
+
+func parseKiloContentList(items []any) string {
+	if len(items) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, item := range items {
+		entry := mapFrom(item)
+		entryType := stringFrom(entry["type"])
+		switch entryType {
+		case "text":
+			if text := stringFrom(entry["text"]); text != "" {
+				parts = append(parts, text)
+			}
+		case "tool_result":
+			if content := entry["content"]; content != nil {
+				if contentList, ok := content.([]any); ok {
+					for _, sub := range contentList {
+						subEntry := mapFrom(sub)
+						if text := stringFrom(subEntry["text"]); text != "" {
+							parts = append(parts, text)
+						}
+					}
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func extractTaggedValue(content string, tag string) string {
+	if content == "" {
+		return ""
+	}
+	open := "<" + tag + ">"
+	close := "</" + tag + ">"
+	start := strings.Index(content, open)
+	if start == -1 {
+		return ""
+	}
+	start += len(open)
+	end := strings.Index(content[start:], close)
+	if end == -1 {
+		return ""
+	}
+	return strings.TrimSpace(content[start : start+end])
+}
+
+func extractWorkspaceDirectory(content string) string {
+	needle := "Current Workspace Directory ("
+	start := strings.Index(content, needle)
+	if start == -1 {
+		return ""
+	}
+	start += len(needle)
+	end := strings.Index(content[start:], ")")
+	if end == -1 {
+		return ""
+	}
+	return content[start : start+end]
+}
+
+func normalizeCwd(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimPrefix(trimmed, "file://")
+	return strings.TrimRight(trimmed, `/\`)
+}
+
+func firstStringFromMap(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringFrom(payload[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func loadCursorSessions(root string) ([]SyncSession, error) {
+	dbPath := filepath.Join(root, "ai-tracking", "ai-code-tracking.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return []SyncSession{}, nil
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return []SyncSession{}, nil
+	}
+
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, "SELECT conversationId, title, model, updatedAt FROM conversation_summaries")
+	output, err := cmd.Output()
+	if err != nil {
+		return []SyncSession{}, nil
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	var sessions []SyncSession
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 4 {
+			continue
+		}
+		updatedMs, _ := strconv.ParseInt(parts[3], 10, 64)
+		timestamp := formatMillis(updatedMs)
+		session := SyncSession{
+			ID:        parts[0],
+			Title:     parts[1],
+			Model:     parts[2],
+			StartedAt: timestamp,
+			EndedAt:   timestamp,
+		}
+		if session.Title == "" {
+			session.Title = session.ID
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, nil
+}
+
+func loadAmpSessions(root string) ([]SyncSession, error) {
+	return []SyncSession{}, nil
+}
+
+func loadOpenCodeSessions(root string) ([]SyncSession, error) {
+	return []SyncSession{}, nil
+}
+
+func loadAntigravitySessions(root string) ([]SyncSession, error) {
+	brainDir := filepath.Join(root, "brain")
+	info, err := os.Stat(brainDir)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	var sessions []SyncSession
+	err = filepath.WalkDir(brainDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".metadata.json") {
+			return nil
+		}
+		session, ok := parseAntigravityMetadata(path)
+		if ok {
+			sessions = append(sessions, session)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sessions, nil
+}
+
+type antigravityMetadata struct {
+	ArtifactType string `json:"artifactType"`
+	Summary      string `json:"summary"`
+	UpdatedAt    string `json:"updatedAt"`
+	Version      string `json:"version"`
+}
+
+func parseAntigravityMetadata(path string) (SyncSession, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	var meta antigravityMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return SyncSession{}, false
+	}
+
+	updatedAt := meta.UpdatedAt
+	if updatedAt == "" {
+		if stat, err := os.Stat(path); err == nil {
+			updatedAt = stat.ModTime().Format(time.RFC3339)
+		}
+	}
+
+	id := filepath.Base(filepath.Dir(path))
+	title := strings.TrimSpace(meta.Summary)
+	if title == "" {
+		title = "Antigravity artifact"
+	}
+
+	session := SyncSession{
+		ID:        id,
+		Title:     title,
+		StartedAt: updatedAt,
+		EndedAt:   updatedAt,
+	}
+	if updatedAt != "" {
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:     0,
+			Role:      "assistant",
+			Content:   title,
+			Timestamp: updatedAt,
+		})
+	}
+	return session, session.ID != ""
+}
+
+type droidSessionStart struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Cwd   string `json:"cwd"`
+}
+
+type droidMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
+type droidTokenUsage struct {
+	InputTokens        int `json:"inputTokens"`
+	OutputTokens       int `json:"outputTokens"`
+	CacheCreationTokens int `json:"cacheCreationTokens"`
+	CacheReadTokens    int `json:"cacheReadTokens"`
+	ThinkingTokens     int `json:"thinkingTokens"`
+}
+
+type droidSettings struct {
+	Model      string          `json:"model"`
+	TokenUsage droidTokenUsage `json:"tokenUsage"`
+}
+
+func loadDroidSessions(root string) ([]SyncSession, error) {
+	sessionsDir := filepath.Join(root, "sessions")
+	info, err := os.Stat(sessionsDir)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	var sessions []SyncSession
+	err = filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		session, ok := parseDroidSession(path)
+		if ok {
+			sessions = append(sessions, session)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sessions, nil
+}
+
+func parseDroidSession(path string) (SyncSession, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	defer file.Close()
+
+	var session SyncSession
+	var startedAt time.Time
+	var endedAt time.Time
+	msgIndex := 0
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			continue
+		}
+		switch stringFrom(item["type"]) {
+		case "session_start":
+			var start droidSessionStart
+			if err := decodeInto(item, &start); err == nil {
+				if start.ID != "" {
+					session.ID = start.ID
+				}
+				if start.Title != "" {
+					session.Title = start.Title
+				}
+				if start.Cwd != "" {
+					session.Cwd = start.Cwd
+				}
+			}
+		case "message":
+			var message droidMessage
+			if err := decodeInto(item["message"], &message); err != nil {
+				message = droidMessage{Role: stringFrom(mapFrom(item["message"])["role"]), Content: mapFrom(item["message"])["content"]}
+			}
+			content := parseMessageContent(message.Content)
+			if content == "" {
+				continue
+			}
+			role := message.Role
+			if role == "" {
+				role = "user"
+			}
+			timestamp := stringFrom(item["timestamp"])
+			session.Messages = append(session.Messages, SyncMessage{
+				Index:     msgIndex,
+				Role:      role,
+				Content:   content,
+				Timestamp: timestamp,
+			})
+			msgIndex++
+			if session.Title == "" && role == "user" {
+				session.Title = content
+			}
+			if timestamp != "" {
+				if ts, err := time.Parse(time.RFC3339, timestamp); err == nil {
+					if startedAt.IsZero() || ts.Before(startedAt) {
+						startedAt = ts
+					}
+					if endedAt.IsZero() || ts.After(endedAt) {
+						endedAt = ts
+					}
+				}
+			}
+		}
+	}
+
+	if session.ID == "" {
+		session.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	}
+	if session.Title == "" {
+		session.Title = "Droid session"
+	}
+
+	settingsPath := strings.TrimSuffix(path, ".jsonl") + ".settings.json"
+	if raw, err := os.ReadFile(settingsPath); err == nil {
+		var settings droidSettings
+		if err := json.Unmarshal(raw, &settings); err == nil {
+			if settings.Model != "" {
+				session.Model = settings.Model
+			}
+			cached := settings.TokenUsage.CacheReadTokens + settings.TokenUsage.CacheCreationTokens
+			session.TotalInputTokens = settings.TokenUsage.InputTokens
+			session.TotalOutputTokens = settings.TokenUsage.OutputTokens
+			session.TotalCachedInputTokens = cached
+			session.TotalReasoningTokens = settings.TokenUsage.ThinkingTokens
+			session.TotalTokens = settings.TokenUsage.InputTokens + settings.TokenUsage.OutputTokens + cached + settings.TokenUsage.ThinkingTokens
+		}
+	}
+
+	if session.TotalTokens == 0 {
+		session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens + session.TotalReasoningTokens
+	}
+
+	if session.StartedAt == "" && !startedAt.IsZero() {
+		session.StartedAt = startedAt.Format(time.RFC3339)
+	}
+	if session.EndedAt == "" && !endedAt.IsZero() {
+		session.EndedAt = endedAt.Format(time.RFC3339)
+	}
+	if session.StartedAt == "" {
+		if stat, err := os.Stat(path); err == nil {
+			session.StartedAt = stat.ModTime().Format(time.RFC3339)
+			session.EndedAt = session.StartedAt
+		}
+	}
+
+	return session, session.ID != ""
+}
+
+func parseClaudeContent(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			entryType := stringFrom(entry["type"])
+			switch entryType {
+			case "text":
+				text := stringFrom(entry["text"])
+				if text != "" {
+					parts = append(parts, text)
+				}
+			case "tool_use":
+				name := stringFrom(entry["name"])
+				input := entry["input"]
+				inputText := stringifyJSON(input)
+				if inputText == "" {
+					parts = append(parts, fmt.Sprintf("[tool_use] %s", name))
+				} else {
+					parts = append(parts, fmt.Sprintf("[tool_use] %s\n%s", name, inputText))
+				}
+			case "tool_result":
+				content := entry["content"]
+				contentText := stringifyJSON(content)
+				if contentText == "" {
+					contentText = stringFrom(content)
+				}
+				if contentText != "" {
+					parts = append(parts, fmt.Sprintf("[tool_result]\n%s", contentText))
+				} else {
+					parts = append(parts, "[tool_result]")
+				}
+			case "image":
+				parts = append(parts, "[image]")
+			default:
+				raw := stringifyJSON(entry)
+				if raw != "" {
+					parts = append(parts, raw)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	default:
+		return ""
+	}
+}
+
+func stringifyJSON(value any) string {
+	if value == nil {
+		return ""
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func decodeInto(value any, target any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, target)
+}
+
+func parseMessageContent(value any) string {
+	items, ok := value.([]any)
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, ok := entry["text"].(string)
+		if !ok {
+			continue
+		}
+		parts = append(parts, text)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func syncPayload(server string, deviceToken string, payload SyncPayload) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	url := strings.TrimRight(server, "/") + "/v1/sync"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if deviceToken != "" {
+		req.Header.Set("Authorization", "Bearer "+deviceToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned %s: %s", resp.Status, string(body))
+	}
+	return nil
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func expandUser(path string) string {
+	if strings.HasPrefix(path, "~") {
+		home, _ := os.UserHomeDir()
+		if path == "~" {
+			return home
+		}
+		return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	return path
+}
+
+func hostname() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return name
+}
+
+func stringFrom(value any) string {
+	if value == nil {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func mapFrom(value any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
+	if m, ok := value.(map[string]any); ok {
+		return m
+	}
+	return map[string]any{}
+}
+
+func intFrom(value any, fallback int) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return int(i)
+		}
+		if f, err := v.Float64(); err == nil {
+			return int(f)
+		}
+	case string:
+		if v == "" {
+			return fallback
+		}
+		if i, err := json.Number(v).Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return fallback
+}
+
+func int64From(value any, fallback int64) int64 {
+	switch v := value.(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i
+		}
+		if f, err := v.Float64(); err == nil {
+			return int64(f)
+		}
+	case string:
+		if v == "" {
+			return fallback
+		}
+		if i, err := json.Number(v).Int64(); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
+func formatMillis(ms int64) string {
+	if ms <= 0 {
+		return ""
+	}
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339)
+}
+
+func parseSources(value string) ([]string, error) {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" || normalized == "auto" || normalized == "default" || normalized == "all" {
+		return []string{
+			"codex",
+			"claude",
+			"gemini",
+			"qwen",
+			"cline",
+			"continue",
+			"kilocode",
+			"cursor",
+			"amp",
+			"opencode",
+			"antigravity",
+			"droid",
+		}, nil
+	}
+	parts := strings.Split(normalized, ",")
+	allowed := map[string]bool{
+		"codex":       true,
+		"claude":      true,
+		"gemini":      true,
+		"qwen":        true,
+		"cline":       true,
+		"continue":    true,
+		"kilocode":    true,
+		"cursor":      true,
+		"amp":         true,
+		"opencode":    true,
+		"antigravity": true,
+		"droid":       true,
+	}
+	seen := map[string]bool{}
+	var sources []string
+	for _, part := range parts {
+		source := strings.TrimSpace(part)
+		if source == "" {
+			continue
+		}
+		if source == "all" {
+			return []string{
+				"codex",
+				"claude",
+				"gemini",
+				"qwen",
+				"cline",
+				"continue",
+				"kilocode",
+				"cursor",
+				"amp",
+				"opencode",
+				"antigravity",
+				"droid",
+			}, nil
+		}
+		if !allowed[source] {
+			return nil, fmt.Errorf("unsupported source %q", source)
+		}
+		if !seen[source] {
+			sources = append(sources, source)
+			seen[source] = true
+		}
+	}
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no valid sources provided")
+	}
+	return sources, nil
+}
+
+func defaultToolName(source string) string {
+	switch source {
+	case "codex":
+		return "codex"
+	case "claude":
+		return "claude-code"
+	case "gemini":
+		return "gemini"
+	case "qwen":
+		return "qwen"
+	case "cline":
+		return "cline"
+	case "continue":
+		return "continue"
+	case "kilocode":
+		return "kilocode"
+	case "cursor":
+		return "cursor"
+	case "amp":
+		return "amp"
+	case "opencode":
+		return "opencode"
+	case "antigravity":
+		return "antigravity"
+	case "droid":
+		return "droid"
+	default:
+		return source
+	}
+}
