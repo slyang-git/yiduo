@@ -16,10 +16,10 @@ YIDUO_TAG=v0.1.0 curl -fsSL https://github.com/slyang-git/yiduo/releases/latest/
 
 ## Usage
 
-Build and run:
+Run the binary:
 
 ```sh
-go run . --source auto --server http://localhost:8000
+yiduo --source auto --server http://localhost:8000
 ```
 
 Environment:
@@ -30,5 +30,5 @@ Environment:
 Example:
 
 ```sh
-AI_WRAPPED_DEVICE_TOKEN=... go run . --source auto --server http://localhost:8000
+AI_WRAPPED_DEVICE_TOKEN=... yiduo --source auto --server http://localhost:8000
 ```
