@@ -2,6 +2,18 @@
 
 Device sync agent for AI Wrapped.
 
+## Install
+
+```sh
+curl -fsSL https://github.com/slyang-git/yiduo/releases/latest/download/install.sh | bash
+```
+
+Install a specific version:
+
+```sh
+YIDUO_TAG=v0.1.0 curl -fsSL https://github.com/slyang-git/yiduo/releases/latest/download/install.sh | bash
+```
+
 ## Usage
 
 Build and run:
