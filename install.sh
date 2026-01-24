@@ -29,11 +29,6 @@ if [ -z "$SERVER" ]; then
   SERVER="http://localhost:8000"
 fi
 
-if ! command -v go >/dev/null 2>&1; then
-  echo "Go is required to build the agent. Please install Go and rerun."
-  exit 1
-fi
-
 BIN_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.yiduo"
 CONFIG_PATH="$CONFIG_DIR/config.json"
@@ -44,20 +39,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Downloading agent source..."
-curl -fsSL "https://codeload.github.com/slyang-git/yiduo/tar.gz/refs/heads/main" | tar -xz -C "$TMP_DIR"
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
 
-AGENT_SRC_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d -name "yiduo-*" | head -n 1)
-if [ -z "$AGENT_SRC_DIR" ]; then
-  echo "Failed to locate agent source."
-  exit 1
+case "$OS" in
+  linux|darwin) ;;
+  *)
+    echo "Unsupported OS: $OS"
+    exit 1
+    ;;
+esac
+
+case "$ARCH" in
+  x86_64|amd64) ARCH="amd64" ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *)
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+    ;;
+esac
+
+TAG="${YIDUO_TAG:-latest}"
+if [ "$TAG" = "latest" ]; then
+  ARCHIVE_URL="https://github.com/slyang-git/yiduo/releases/latest/download/yiduo_${OS}_${ARCH}.tar.gz"
+else
+  ARCHIVE_URL="https://github.com/slyang-git/yiduo/releases/download/${TAG}/yiduo_${OS}_${ARCH}.tar.gz"
 fi
 
-mkdir -p "$BIN_DIR"
-cd "$AGENT_SRC_DIR"
+echo "Downloading agent binary..."
+curl -fsSL "$ARCHIVE_URL" -o "$TMP_DIR/yiduo.tar.gz"
+tar -xzf "$TMP_DIR/yiduo.tar.gz" -C "$TMP_DIR"
 
-echo "Building agent..."
-go build -o "$BIN_DIR/yiduo" .
+mkdir -p "$BIN_DIR"
+if [ ! -f "$TMP_DIR/yiduo" ]; then
+  echo "Failed to locate yiduo binary in archive."
+  exit 1
+fi
+mv "$TMP_DIR/yiduo" "$BIN_DIR/yiduo"
 
 mkdir -p "$CONFIG_DIR"
 cat > "$CONFIG_PATH" <<EOT
