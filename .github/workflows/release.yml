@@ -68,7 +68,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/**/dist/*.tar.gz
-            dist/**/dist/install.sh
+            dist/**/yiduo_*.tar.gz
+            dist/**/install.sh
           fail_on_unmatched_files: true
           tag_name: ${{ github.ref_name }}
