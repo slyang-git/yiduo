@@ -19,3 +19,8 @@ Later, to sync again, just run:
 yiduo sync
 ```
 
+Run a background daemon that syncs every minute:
+
+```sh
+yiduo sync --daemon
+```

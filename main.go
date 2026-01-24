@@ -54,6 +54,17 @@ type tokenTotals struct {
 	reasoningOutputTokens int
 }
 
+type syncState struct {
+	LastSync map[string]string `json:"last_sync"`
+}
+
+type syncOptions struct {
+	incremental bool
+	state       *syncState
+}
+
+const daemonEnv = "YIDUO_DAEMON"
+
 func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "sync" {
@@ -64,6 +75,8 @@ func main() {
 	tool := flag.String("tool", "", "tool name override")
 	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|antigravity|droid (comma-separated)")
 	deviceToken := flag.String("device-token", "", "device token for sync authentication")
+	daemon := flag.Bool("daemon", false, "run periodic sync in background")
+	daemonShort := flag.Bool("d", false, "shorthand for --daemon")
 	codexRoot := flag.String("codex-root", envOrDefault("CODEX_ROOT", "~/.codex"), "Codex root")
 	claudeRoot := flag.String("claude-root", envOrDefault("CLAUDE_ROOT", "~/.claude"), "Claude Code root")
 	geminiRoot := flag.String("gemini-root", envOrDefault("GEMINI_ROOT", "~/.gemini"), "Gemini CLI root")
@@ -82,6 +95,17 @@ func main() {
 		os.Exit(2)
 	}
 
+	daemonEnabled := *daemon || *daemonShort
+	daemonWorker := daemonEnabled && os.Getenv(daemonEnv) != ""
+	if daemonEnabled && !daemonWorker {
+		if err := spawnDaemon(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start daemon: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("yiduo sync daemon started")
+		return
+	}
+
 	config := loadConfig()
 	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "http://localhost:8000")
 	resolvedDeviceToken := firstNonEmpty(*deviceToken, os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.DeviceToken)
@@ -98,61 +122,45 @@ func main() {
 		toolOverride = ""
 	}
 
-	totalSessions := 0
-	for _, sourceName := range sources {
-		toolName := defaultToolName(sourceName)
-		if toolOverride != "" {
-			toolName = toolOverride
-		}
+	options := syncOptions{}
+	if daemonWorker {
+		options.incremental = true
+		state := loadSyncState()
+		options.state = &state
+	}
 
-		var sessions []SyncSession
-		switch sourceName {
-		case "codex":
-			sessions, err = loadCodexSessions(expandUser(*codexRoot))
-		case "claude":
-			sessions, err = loadClaudeSessions(expandUser(*claudeRoot))
-		case "gemini":
-			sessions, err = loadGeminiSessions(expandUser(*geminiRoot))
-		case "qwen":
-			sessions, err = loadQwenSessions(expandUser(*qwenRoot))
-		case "cline":
-			sessions, err = loadClineSessions(expandUser(*clineRoot))
-		case "continue":
-			sessions, err = loadContinueSessions(expandUser(*continueRoot))
-		case "kilocode":
-			sessions, err = loadKiloCodeSessions(expandUser(*kiloRoot))
-		case "cursor":
-			sessions, err = loadCursorSessions(expandUser(*cursorRoot))
-		case "amp":
-			sessions, err = loadAmpSessions(expandUser(*ampRoot))
-		case "opencode":
-			sessions, err = loadOpenCodeSessions(expandUser(*opencodeRoot))
-		case "antigravity":
-			sessions, err = loadAntigravitySessions(expandUser(*antigravityRoot))
-		case "droid":
-			sessions, err = loadDroidSessions(expandUser(*droidRoot))
-		default:
-			fmt.Fprintf(os.Stderr, "unknown source: %s\n", sourceName)
-			os.Exit(1)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to load %s sessions: %v\n", sourceName, err)
-			os.Exit(1)
-		}
+	runOnce := func() (int, error) {
+		return syncOnce(syncParams{
+			server:           resolvedServer,
+			deviceToken:      resolvedDeviceToken,
+			agentID:          *agentID,
+			host:             *host,
+			toolOverride:     toolOverride,
+			sources:          sources,
+			codexRoot:        expandUser(*codexRoot),
+			claudeRoot:       expandUser(*claudeRoot),
+			geminiRoot:       expandUser(*geminiRoot),
+			qwenRoot:         expandUser(*qwenRoot),
+			clineRoot:        expandUser(*clineRoot),
+			continueRoot:     expandUser(*continueRoot),
+			kiloRoot:         expandUser(*kiloRoot),
+			cursorRoot:       expandUser(*cursorRoot),
+			ampRoot:          expandUser(*ampRoot),
+			opencodeRoot:     expandUser(*opencodeRoot),
+			antigravityRoot:  expandUser(*antigravityRoot),
+			droidRoot:        expandUser(*droidRoot),
+		}, options)
+	}
 
-		payload := SyncPayload{
-			AgentID:  *agentID,
-			Tool:     toolName,
-			Host:     *host,
-			Sessions: sessions,
-		}
+	if daemonWorker {
+		runSyncLoop(runOnce, options.state)
+		return
+	}
 
-		if err := syncPayload(resolvedServer, resolvedDeviceToken, payload); err != nil {
-			fmt.Fprintf(os.Stderr, "sync failed for %s: %v\n", sourceName, err)
-			os.Exit(1)
-		}
-
-		totalSessions += len(sessions)
+	totalSessions, err := runOnce()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 
 	if len(sources) == 1 {
@@ -160,6 +168,217 @@ func main() {
 	} else {
 		fmt.Printf("Synced %d sessions across %d tools to %s\n", totalSessions, len(sources), resolvedServer)
 	}
+}
+
+type syncParams struct {
+	server          string
+	deviceToken     string
+	agentID         string
+	host            string
+	toolOverride    string
+	sources         []string
+	codexRoot       string
+	claudeRoot      string
+	geminiRoot      string
+	qwenRoot        string
+	clineRoot       string
+	continueRoot    string
+	kiloRoot        string
+	cursorRoot      string
+	ampRoot         string
+	opencodeRoot    string
+	antigravityRoot string
+	droidRoot       string
+}
+
+func syncOnce(params syncParams, options syncOptions) (int, error) {
+	totalSessions := 0
+	for _, sourceName := range params.sources {
+		toolName := defaultToolName(sourceName)
+		if params.toolOverride != "" {
+			toolName = params.toolOverride
+		}
+
+		var sessions []SyncSession
+		var err error
+		switch sourceName {
+		case "codex":
+			sessions, err = loadCodexSessions(params.codexRoot)
+		case "claude":
+			sessions, err = loadClaudeSessions(params.claudeRoot)
+		case "gemini":
+			sessions, err = loadGeminiSessions(params.geminiRoot)
+		case "qwen":
+			sessions, err = loadQwenSessions(params.qwenRoot)
+		case "cline":
+			sessions, err = loadClineSessions(params.clineRoot)
+		case "continue":
+			sessions, err = loadContinueSessions(params.continueRoot)
+		case "kilocode":
+			sessions, err = loadKiloCodeSessions(params.kiloRoot)
+		case "cursor":
+			sessions, err = loadCursorSessions(params.cursorRoot)
+		case "amp":
+			sessions, err = loadAmpSessions(params.ampRoot)
+		case "opencode":
+			sessions, err = loadOpenCodeSessions(params.opencodeRoot)
+		case "antigravity":
+			sessions, err = loadAntigravitySessions(params.antigravityRoot)
+		case "droid":
+			sessions, err = loadDroidSessions(params.droidRoot)
+		default:
+			return 0, fmt.Errorf("unknown source: %s", sourceName)
+		}
+		if err != nil {
+			return 0, fmt.Errorf("failed to load %s sessions: %v", sourceName, err)
+		}
+
+		var maxUpdated time.Time
+		if options.incremental {
+			since := time.Time{}
+			if options.state != nil {
+				if ts, ok := options.state.LastSync[sourceName]; ok {
+					if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+						since = parsed
+					}
+				}
+			}
+			sessions, maxUpdated = filterSessionsSince(sessions, since)
+			if len(sessions) == 0 {
+				continue
+			}
+		}
+
+		payload := SyncPayload{
+			AgentID:  params.agentID,
+			Tool:     toolName,
+			Host:     params.host,
+			Sessions: sessions,
+		}
+
+		if err := syncPayload(params.server, params.deviceToken, payload); err != nil {
+			return 0, fmt.Errorf("sync failed for %s: %v", sourceName, err)
+		}
+
+		totalSessions += len(sessions)
+		if options.incremental && options.state != nil && !maxUpdated.IsZero() {
+			if options.state.LastSync == nil {
+				options.state.LastSync = map[string]string{}
+			}
+			options.state.LastSync[sourceName] = maxUpdated.UTC().Format(time.RFC3339)
+		}
+	}
+	return totalSessions, nil
+}
+
+func runSyncLoop(runOnce func() (int, error), state *syncState) {
+	for {
+		if _, err := runOnce(); err != nil {
+			fmt.Fprintf(os.Stderr, "sync failed: %v\n", err)
+		} else if state != nil {
+			if err := saveSyncState(*state); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to save sync state: %v\n", err)
+			}
+		}
+		time.Sleep(time.Minute)
+	}
+}
+
+func filterSessionsSince(sessions []SyncSession, since time.Time) ([]SyncSession, time.Time) {
+	if since.IsZero() {
+		return sessions, maxSessionTime(sessions)
+	}
+	filtered := make([]SyncSession, 0, len(sessions))
+	var maxUpdated time.Time
+	for _, session := range sessions {
+		updatedAt := sessionUpdatedAt(session)
+		if updatedAt.IsZero() || updatedAt.After(since) {
+			filtered = append(filtered, session)
+			if updatedAt.After(maxUpdated) {
+				maxUpdated = updatedAt
+			}
+		}
+	}
+	return filtered, maxUpdated
+}
+
+func sessionUpdatedAt(session SyncSession) time.Time {
+	if session.EndedAt != "" {
+		if ts, err := time.Parse(time.RFC3339, session.EndedAt); err == nil {
+			return ts
+		}
+	}
+	if session.StartedAt != "" {
+		if ts, err := time.Parse(time.RFC3339, session.StartedAt); err == nil {
+			return ts
+		}
+	}
+	return time.Time{}
+}
+
+func maxSessionTime(sessions []SyncSession) time.Time {
+	var maxUpdated time.Time
+	for _, session := range sessions {
+		updatedAt := sessionUpdatedAt(session)
+		if updatedAt.After(maxUpdated) {
+			maxUpdated = updatedAt
+		}
+	}
+	return maxUpdated
+}
+
+func loadSyncState() syncState {
+	path := syncStatePath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return syncState{LastSync: map[string]string{}}
+	}
+	var state syncState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return syncState{LastSync: map[string]string{}}
+	}
+	if state.LastSync == nil {
+		state.LastSync = map[string]string{}
+	}
+	return state
+}
+
+func saveSyncState(state syncState) error {
+	path := syncStatePath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func syncStatePath() string {
+	return filepath.Join(expandUser("~/.yiduo"), "sync-state.json")
+}
+
+func spawnDaemon() error {
+	cmd := exec.Command(os.Args[0], os.Args[1:]...)
+	cmd.Env = append(os.Environ(), daemonEnv+"=1")
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err == nil {
+		cmd.Stdin = devNull
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
+	}
+	if err := cmd.Start(); err != nil {
+		if devNull != nil {
+			_ = devNull.Close()
+		}
+		return err
+	}
+	if devNull != nil {
+		_ = devNull.Close()
+	}
+	return cmd.Process.Release()
 }
 
 func loadCodexSessions(root string) ([]SyncSession, error) {
