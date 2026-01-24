@@ -34,8 +34,7 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-AGENT_HOME="$HOME/.ai-wrapped"
-BIN_DIR="$AGENT_HOME/bin"
+BIN_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.yiduo"
 CONFIG_PATH="$CONFIG_DIR/config.json"
 TMP_DIR="$(mktemp -d)"
@@ -59,12 +58,6 @@ cd "$AGENT_SRC_DIR"
 
 echo "Building agent..."
 go build -o "$BIN_DIR/yiduo" .
-
-mkdir -p "$AGENT_HOME"
-cat > "$AGENT_HOME/agent.env" <<EOT
-AI_WRAPPED_DEVICE_TOKEN=$TOKEN
-AI_WRAPPED_SERVER=$SERVER
-EOT
 
 mkdir -p "$CONFIG_DIR"
 cat > "$CONFIG_PATH" <<EOT
