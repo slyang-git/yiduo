@@ -24,3 +24,10 @@ Run a background daemon that syncs every minute:
 ```sh
 yiduo sync --daemon
 ```
+
+Check daemon status or stop it:
+
+```sh
+yiduo sync status
+yiduo sync stop
+```

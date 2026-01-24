@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -95,9 +97,29 @@ func main() {
 		os.Exit(2)
 	}
 
+	extraArgs := flag.Args()
+	if len(extraArgs) > 0 {
+		switch extraArgs[0] {
+		case "status":
+			printDaemonStatus()
+			return
+		case "stop":
+			if err := stopDaemon(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to stop daemon: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("yiduo sync daemon stopped")
+			return
+		}
+	}
+
 	daemonEnabled := *daemon || *daemonShort
 	daemonWorker := daemonEnabled && os.Getenv(daemonEnv) != ""
 	if daemonEnabled && !daemonWorker {
+		if running, pid := daemonRunning(); running {
+			fmt.Printf("yiduo sync daemon already running (pid %d)\n", pid)
+			return
+		}
 		if err := spawnDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to start daemon: %v\n", err)
 			os.Exit(1)
@@ -153,6 +175,9 @@ func main() {
 	}
 
 	if daemonWorker {
+		if err := writeDaemonPid(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write daemon pid: %v\n", err)
+		}
 		runSyncLoop(runOnce, options.state)
 		return
 	}
@@ -272,6 +297,14 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 }
 
 func runSyncLoop(runOnce func() (int, error), state *syncState) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	defer removeDaemonPid()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
+
 	for {
 		if _, err := runOnce(); err != nil {
 			fmt.Fprintf(os.Stderr, "sync failed: %v\n", err)
@@ -280,7 +313,12 @@ func runSyncLoop(runOnce func() (int, error), state *syncState) {
 				fmt.Fprintf(os.Stderr, "failed to save sync state: %v\n", err)
 			}
 		}
-		time.Sleep(time.Minute)
+
+		select {
+		case <-quit:
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -375,10 +413,90 @@ func spawnDaemon() error {
 		}
 		return err
 	}
+	if err := writeDaemonPidWith(cmd.Process.Pid); err != nil {
+		if devNull != nil {
+			_ = devNull.Close()
+		}
+		return err
+	}
 	if devNull != nil {
 		_ = devNull.Close()
 	}
 	return cmd.Process.Release()
+}
+
+func printDaemonStatus() {
+	if running, pid := daemonRunning(); running {
+		fmt.Printf("yiduo sync daemon running (pid %d)\n", pid)
+		return
+	}
+	fmt.Println("yiduo sync daemon not running")
+}
+
+func stopDaemon() error {
+	pid, err := readDaemonPid()
+	if err != nil {
+		return err
+	}
+	if pid == 0 {
+		return fmt.Errorf("daemon pid not found")
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		return err
+	}
+	return nil
+}
+
+func daemonRunning() (bool, int) {
+	pid, err := readDaemonPid()
+	if err != nil || pid == 0 {
+		return false, 0
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		return false, 0
+	}
+	return true, pid
+}
+
+func readDaemonPid() (int, error) {
+	raw, err := os.ReadFile(daemonPidPath())
+	if err != nil {
+		return 0, err
+	}
+	value := strings.TrimSpace(string(raw))
+	if value == "" {
+		return 0, nil
+	}
+	pid, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
+}
+
+func writeDaemonPid() error {
+	return writeDaemonPidWith(os.Getpid())
+}
+
+func writeDaemonPidWith(pid int) error {
+	path := daemonPidPath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0o600)
+}
+
+func removeDaemonPid() {
+	_ = os.Remove(daemonPidPath())
+}
+
+func daemonPidPath() string {
+	return filepath.Join(expandUser("~/.yiduo"), "daemon.pid")
 }
 
 func loadCodexSessions(root string) ([]SyncSession, error) {
