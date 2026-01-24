@@ -36,6 +36,8 @@ fi
 
 AGENT_HOME="$HOME/.ai-wrapped"
 BIN_DIR="$AGENT_HOME/bin"
+CONFIG_DIR="$HOME/.yiduo"
+CONFIG_PATH="$CONFIG_DIR/config.json"
 TMP_DIR="$(mktemp -d)"
 
 cleanup() {
@@ -64,8 +66,16 @@ AI_WRAPPED_DEVICE_TOKEN=$TOKEN
 AI_WRAPPED_SERVER=$SERVER
 EOT
 
+mkdir -p "$CONFIG_DIR"
+cat > "$CONFIG_PATH" <<EOT
+{
+  "device_token": "$TOKEN",
+  "server": "$SERVER"
+}
+EOT
+
 echo "Syncing sessions..."
-AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" --source auto --server "$SERVER"
+AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" sync --source auto --server "$SERVER"
 
 echo "Done. You can re-run the agent with:"
-echo "  AI_WRAPPED_DEVICE_TOKEN=$TOKEN $BIN_DIR/yiduo --source auto --server $SERVER"
+echo "  $BIN_DIR/yiduo sync"

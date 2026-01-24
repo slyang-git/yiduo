@@ -24,6 +24,12 @@ Run the binary:
 yiduo --source auto --server http://localhost:8000
 ```
 
+Or save credentials in `~/.yiduo/config.json` and run:
+
+```sh
+yiduo sync
+```
+
 Environment:
 
 - `AI_WRAPPED_DEVICE_TOKEN`: device token for sync

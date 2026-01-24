@@ -55,10 +55,15 @@ type tokenTotals struct {
 }
 
 func main() {
-	server := flag.String("server", envOrDefault("AI_WRAPPED_SERVER", "http://localhost:8000"), "API server base URL")
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "sync" {
+		args = args[1:]
+	}
+
+	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
 	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|antigravity|droid (comma-separated)")
-	deviceToken := flag.String("device-token", envOrDefault("AI_WRAPPED_DEVICE_TOKEN", ""), "device token for sync authentication")
+	deviceToken := flag.String("device-token", "", "device token for sync authentication")
 	codexRoot := flag.String("codex-root", envOrDefault("CODEX_ROOT", "~/.codex"), "Codex root")
 	claudeRoot := flag.String("claude-root", envOrDefault("CLAUDE_ROOT", "~/.claude"), "Claude Code root")
 	geminiRoot := flag.String("gemini-root", envOrDefault("GEMINI_ROOT", "~/.gemini"), "Gemini CLI root")
@@ -73,7 +78,13 @@ func main() {
 	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
 	agentID := flag.String("agent-id", "local", "agent id")
 	host := flag.String("host", hostname(), "host name")
-	flag.Parse()
+	if err := flag.CommandLine.Parse(args); err != nil {
+		os.Exit(2)
+	}
+
+	config := loadConfig()
+	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "http://localhost:8000")
+	resolvedDeviceToken := firstNonEmpty(*deviceToken, os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.DeviceToken)
 
 	sources, err := parseSources(*source)
 	if err != nil {
@@ -136,7 +147,7 @@ func main() {
 			Sessions: sessions,
 		}
 
-		if err := syncPayload(*server, *deviceToken, payload); err != nil {
+		if err := syncPayload(resolvedServer, resolvedDeviceToken, payload); err != nil {
 			fmt.Fprintf(os.Stderr, "sync failed for %s: %v\n", sourceName, err)
 			os.Exit(1)
 		}
@@ -145,9 +156,9 @@ func main() {
 	}
 
 	if len(sources) == 1 {
-		fmt.Printf("Synced %d sessions to %s\n", totalSessions, *server)
+		fmt.Printf("Synced %d sessions to %s\n", totalSessions, resolvedServer)
 	} else {
-		fmt.Printf("Synced %d sessions across %d tools to %s\n", totalSessions, len(sources), *server)
+		fmt.Printf("Synced %d sessions across %d tools to %s\n", totalSessions, len(sources), resolvedServer)
 	}
 }
 
@@ -1660,6 +1671,37 @@ func hostname() string {
 		return "unknown"
 	}
 	return name
+}
+
+type yiduoConfig struct {
+	DeviceToken string `json:"device_token"`
+	Server      string `json:"server"`
+}
+
+func loadConfig() yiduoConfig {
+	path := configPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return yiduoConfig{}
+	}
+	var cfg yiduoConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return yiduoConfig{}
+	}
+	return cfg
+}
+
+func configPath() string {
+	return filepath.Join(expandUser("~/.yiduo"), "config.json")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func stringFrom(value any) string {
