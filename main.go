@@ -110,6 +110,9 @@ func main() {
 			}
 			fmt.Println("yiduo sync daemon stopped")
 			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command: %s\n", extraArgs[0])
+			os.Exit(2)
 		}
 	}
 
@@ -178,7 +181,14 @@ func main() {
 		if err := writeDaemonPid(); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write daemon pid: %v\n", err)
 		}
-		runSyncLoop(runOnce, options.state)
+		logFile, err := openDaemonLog()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to open daemon log: %v\n", err)
+		}
+		if logFile != nil {
+			defer logFile.Close()
+		}
+		runSyncLoop(runOnce, options.state, logFile)
 		return
 	}
 
@@ -296,7 +306,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 	return totalSessions, nil
 }
 
-func runSyncLoop(runOnce func() (int, error), state *syncState) {
+func runSyncLoop(runOnce func() (int, error), state *syncState, logFile *os.File) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	defer removeDaemonPid()
@@ -305,17 +315,26 @@ func runSyncLoop(runOnce func() (int, error), state *syncState) {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(quit)
 
+	logDaemonf(logFile, "daemon started")
 	for {
-		if _, err := runOnce(); err != nil {
+		logDaemonf(logFile, "sync start")
+		totalSessions, err := runOnce()
+		if err != nil {
+			logDaemonf(logFile, "sync failed: %v", err)
 			fmt.Fprintf(os.Stderr, "sync failed: %v\n", err)
 		} else if state != nil {
 			if err := saveSyncState(*state); err != nil {
+				logDaemonf(logFile, "failed to save sync state: %v", err)
 				fmt.Fprintf(os.Stderr, "failed to save sync state: %v\n", err)
 			}
+			logDaemonf(logFile, "sync complete: sessions=%d", totalSessions)
+		} else {
+			logDaemonf(logFile, "sync complete: sessions=%d", totalSessions)
 		}
 
 		select {
 		case <-quit:
+			logDaemonf(logFile, "daemon stopped")
 			return
 		case <-ticker.C:
 		}
@@ -497,6 +516,29 @@ func removeDaemonPid() {
 
 func daemonPidPath() string {
 	return filepath.Join(expandUser("~/.yiduo"), "daemon.pid")
+}
+
+func daemonLogPath() string {
+	return filepath.Join(expandUser("~/.yiduo"), "sync.log")
+}
+
+func openDaemonLog() (*os.File, error) {
+	path := daemonLogPath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+}
+
+func logDaemonf(file *os.File, format string, args ...any) {
+	if file == nil {
+		return
+	}
+	timestamp := time.Now().Format(time.RFC3339)
+	fmt.Fprintf(file, "%s ", timestamp)
+	fmt.Fprintf(file, format, args...)
+	fmt.Fprintln(file)
 }
 
 func loadCodexSessions(root string) ([]SyncSession, error) {
