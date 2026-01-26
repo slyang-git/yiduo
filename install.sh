@@ -33,6 +33,7 @@ BIN_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.yiduo"
 CONFIG_PATH="$CONFIG_DIR/config.json"
 TMP_DIR="$(mktemp -d)"
+DEVICE_ID=""
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -78,10 +79,30 @@ fi
 mv "$TMP_DIR/yiduo" "$BIN_DIR/yiduo"
 
 mkdir -p "$CONFIG_DIR"
+if command -v uuidgen >/dev/null 2>&1; then
+  DEVICE_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+elif command -v python3 >/dev/null 2>&1; then
+  DEVICE_ID="$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)"
+elif command -v python >/dev/null 2>&1; then
+  DEVICE_ID="$(python - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)"
+elif command -v openssl >/dev/null 2>&1; then
+  DEVICE_ID="$(openssl rand -hex 16)"
+else
+  DEVICE_ID="$(date +%s)$$"
+fi
 cat > "$CONFIG_PATH" <<EOT
 {
   "device_token": "$TOKEN",
-  "server": "$SERVER"
+  "server": "$SERVER",
+  "device_id": "$DEVICE_ID"
 }
 EOT
 

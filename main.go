@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,7 +25,15 @@ type SyncPayload struct {
 	AgentID  string        `json:"agent_id"`
 	Tool     string        `json:"tool"`
 	Host     string        `json:"host"`
+	Device   DeviceInfo    `json:"device"`
 	Sessions []SyncSession `json:"sessions"`
+}
+
+type DeviceInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	OS   string `json:"os"`
+	Arch string `json:"arch"`
 }
 
 type SyncSession struct {
@@ -132,8 +142,19 @@ func main() {
 	}
 
 	config := loadConfig()
+	config, err := ensureDeviceID(config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to ensure device id: %v\n", err)
+		os.Exit(1)
+	}
 	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "http://localhost:8000")
 	resolvedDeviceToken := firstNonEmpty(*deviceToken, os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.DeviceToken)
+	deviceInfo := DeviceInfo{
+		ID:   config.DeviceID,
+		Name: *host,
+		OS:   runtime.GOOS,
+		Arch: runtime.GOARCH,
+	}
 
 	sources, err := parseSources(*source)
 	if err != nil {
@@ -158,6 +179,7 @@ func main() {
 		return syncOnce(syncParams{
 			server:           resolvedServer,
 			deviceToken:      resolvedDeviceToken,
+			deviceInfo:       deviceInfo,
 			agentID:          *agentID,
 			host:             *host,
 			toolOverride:     toolOverride,
@@ -208,6 +230,7 @@ func main() {
 type syncParams struct {
 	server          string
 	deviceToken     string
+	deviceInfo      DeviceInfo
 	agentID         string
 	host            string
 	toolOverride    string
@@ -288,6 +311,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			AgentID:  params.agentID,
 			Tool:     toolName,
 			Host:     params.host,
+			Device:   params.deviceInfo,
 			Sessions: sessions,
 		}
 
@@ -2055,6 +2079,7 @@ func hostname() string {
 type yiduoConfig struct {
 	DeviceToken string `json:"device_token"`
 	Server      string `json:"server"`
+	DeviceID    string `json:"device_id"`
 }
 
 func loadConfig() yiduoConfig {
@@ -2070,8 +2095,53 @@ func loadConfig() yiduoConfig {
 	return cfg
 }
 
+func saveConfig(cfg yiduoConfig) error {
+	path := configPath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
 func configPath() string {
 	return filepath.Join(expandUser("~/.yiduo"), "config.json")
+}
+
+func ensureDeviceID(cfg yiduoConfig) (yiduoConfig, error) {
+	if strings.TrimSpace(cfg.DeviceID) != "" {
+		return cfg, nil
+	}
+	deviceID, err := newDeviceID()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DeviceID = deviceID
+	if fileExists(configPath()) {
+		if err := saveConfig(cfg); err != nil {
+			return cfg, err
+		}
+	}
+	return cfg, nil
+}
+
+func newDeviceID() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16]), nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func firstNonEmpty(values ...string) string {
