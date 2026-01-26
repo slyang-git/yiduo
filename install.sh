@@ -21,7 +21,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -z "$TOKEN" ]; then
-  echo "Missing --token. Generate the command from the dashboard."
+  echo "❌ Missing --token. Generate the command from the dashboard."
   exit 1
 fi
 
@@ -67,13 +67,15 @@ else
   ARCHIVE_URL="https://github.com/slyang-git/yiduo/releases/download/${TAG}/yiduo_${OS}_${ARCH}.tar.gz"
 fi
 
-echo "Downloading agent binary..."
+echo "🚀 Yiduo CLI installer"
+echo "🔐 Server: $SERVER"
+echo "📥 Downloading agent binary..."
 curl -fsSL "$ARCHIVE_URL" -o "$TMP_DIR/yiduo.tar.gz"
 tar -xzf "$TMP_DIR/yiduo.tar.gz" -C "$TMP_DIR"
 
 mkdir -p "$BIN_DIR"
 if [ ! -f "$TMP_DIR/yiduo" ]; then
-  echo "Failed to locate yiduo binary in archive."
+  echo "❌ Failed to locate yiduo binary in archive."
   exit 1
 fi
 mv "$TMP_DIR/yiduo" "$BIN_DIR/yiduo"
@@ -106,8 +108,11 @@ cat > "$CONFIG_PATH" <<EOT
 }
 EOT
 
-echo "Syncing sessions..."
+echo "🧩 Device ID: $DEVICE_ID"
+echo "✅ Installed to: $BIN_DIR/yiduo"
+echo "📝 Config saved: $CONFIG_PATH"
+echo "🔄 Syncing sessions..."
 AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" sync --source auto --server "$SERVER"
 
-echo "Done. You can re-run the agent with:"
+echo "🎉 Done! You can re-run the agent with:"
 echo "  $BIN_DIR/yiduo sync"
