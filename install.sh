@@ -35,6 +35,25 @@ CONFIG_PATH="$CONFIG_DIR/config.json"
 TMP_DIR="$(mktemp -d)"
 DEVICE_ID=""
 
+COLOR_RESET=""
+COLOR_BOLD=""
+COLOR_GREEN=""
+COLOR_RED=""
+if [ -t 1 ]; then
+  COLOR_RESET="$(printf '\033[0m')"
+  COLOR_BOLD="$(printf '\033[1m')"
+  COLOR_GREEN="$(printf '\033[0;32m')"
+  COLOR_RED="$(printf '\033[0;31m')"
+fi
+
+status_ok() {
+  printf "%s✔%s %s\n" "$COLOR_GREEN" "$COLOR_RESET" "$1"
+}
+
+status_err() {
+  printf "%s✖%s %s\n" "$COLOR_RED" "$COLOR_RESET" "$1"
+}
+
 cleanup() {
   rm -rf "$TMP_DIR"
 }
@@ -46,7 +65,7 @@ ARCH="$(uname -m)"
 case "$OS" in
   linux|darwin) ;;
   *)
-    echo "Unsupported OS: $OS"
+    status_err "Unsupported OS: $OS"
     exit 1
     ;;
 esac
@@ -55,7 +74,7 @@ case "$ARCH" in
   x86_64|amd64) ARCH="amd64" ;;
   arm64|aarch64) ARCH="arm64" ;;
   *)
-    echo "Unsupported architecture: $ARCH"
+    status_err "Unsupported architecture: $ARCH"
     exit 1
     ;;
 esac
@@ -67,18 +86,21 @@ else
   ARCHIVE_URL="https://github.com/slyang-git/yiduo/releases/download/${TAG}/yiduo_${OS}_${ARCH}.tar.gz"
 fi
 
-echo "🚀 Yiduo CLI installer"
-echo "🔐 Server: $SERVER"
-echo "📥 Downloading agent binary..."
+printf "\n%sYiduo Agent Installer%s\n\n" "$COLOR_BOLD" "$COLOR_RESET"
+status_ok "Server: $SERVER"
+status_ok "Detected ${OS}/${ARCH}"
+printf "%sℹ%s Downloading agent binary...\n" "$COLOR_BOLD" "$COLOR_RESET"
 curl -fsSL "$ARCHIVE_URL" -o "$TMP_DIR/yiduo.tar.gz"
 tar -xzf "$TMP_DIR/yiduo.tar.gz" -C "$TMP_DIR"
+status_ok "Package downloaded and extracted"
 
 mkdir -p "$BIN_DIR"
 if [ ! -f "$TMP_DIR/yiduo" ]; then
-  echo "❌ Failed to locate yiduo binary in archive."
+  status_err "Failed to locate yiduo binary in archive."
   exit 1
 fi
 mv "$TMP_DIR/yiduo" "$BIN_DIR/yiduo"
+status_ok "Binary installed to $BIN_DIR"
 
 mkdir -p "$CONFIG_DIR"
 if command -v uuidgen >/dev/null 2>&1; then
@@ -107,12 +129,12 @@ cat > "$CONFIG_PATH" <<EOT
   "device_id": "$DEVICE_ID"
 }
 EOT
+status_ok "Config saved to $CONFIG_PATH"
 
-echo "🧩 Device ID: $DEVICE_ID"
-echo "✅ Installed to: $BIN_DIR/yiduo"
-echo "📝 Config saved: $CONFIG_PATH"
-echo "🔄 Syncing sessions..."
+printf "%sℹ%s Device ID: %s\n" "$COLOR_BOLD" "$COLOR_RESET" "$DEVICE_ID"
+printf "%sℹ%s Syncing sessions...\n" "$COLOR_BOLD" "$COLOR_RESET"
 AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" sync --source auto --server "$SERVER"
 
-echo "🎉 Done! You can re-run the agent with:"
+printf "\n%sInstallation complete!%s\n\n" "$COLOR_GREEN" "$COLOR_RESET"
+echo "Start using Yiduo:"
 echo "  $BIN_DIR/yiduo sync"
