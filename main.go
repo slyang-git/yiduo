@@ -148,7 +148,7 @@ func main() {
 		os.Exit(1)
 	}
 	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "http://localhost:8000")
-	resolvedDeviceToken := firstNonEmpty(*deviceToken, os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.DeviceToken)
+	resolvedDeviceToken := firstNonEmpty(*deviceToken, os.Getenv("AI_WRAPPED_SYNC_TOKEN"), os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.DeviceToken)
 	deviceInfo := DeviceInfo{
 		ID:   config.DeviceID,
 		Name: *host,

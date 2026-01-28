@@ -131,9 +131,11 @@ cat > "$CONFIG_PATH" <<EOT
 EOT
 status_ok "Config saved to $CONFIG_PATH"
 
-printf "%sℹ%s Device ID: %s\n" "$COLOR_BOLD" "$COLOR_RESET" "$DEVICE_ID"
-printf "%sℹ%s Syncing sessions...\n" "$COLOR_BOLD" "$COLOR_RESET"
-AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" sync --source auto --server "$SERVER"
+echo "🧩 Device ID: $DEVICE_ID"
+echo "✅ Installed to: $BIN_DIR/yiduo"
+echo "📝 Config saved: $CONFIG_PATH"
+echo "🔄 Syncing sessions..."
+AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SYNC_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" sync --source auto --server "$SERVER"
 
 printf "\n%sInstallation complete!%s\n\n" "$COLOR_GREEN" "$COLOR_RESET"
 echo "Start using Yiduo:"
