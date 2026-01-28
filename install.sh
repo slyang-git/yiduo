@@ -112,7 +112,7 @@ echo "🧩 Device ID: $DEVICE_ID"
 echo "✅ Installed to: $BIN_DIR/yiduo"
 echo "📝 Config saved: $CONFIG_PATH"
 echo "🔄 Syncing sessions..."
-AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" sync --source auto --server "$SERVER"
+AI_WRAPPED_DEVICE_TOKEN="$TOKEN" AI_WRAPPED_SYNC_TOKEN="$TOKEN" AI_WRAPPED_SERVER="$SERVER" "$BIN_DIR/yiduo" sync --source auto --server "$SERVER"
 
 echo "🎉 Done! You can re-run the agent with:"
 echo "  $BIN_DIR/yiduo sync"
