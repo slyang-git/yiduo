@@ -73,6 +73,7 @@ type syncState struct {
 type syncOptions struct {
 	incremental bool
 	state       *syncState
+	logf        func(format string, args ...any)
 }
 
 const daemonEnv = "YIDUO_DAEMON"
@@ -209,9 +210,16 @@ func main() {
 		}
 		if logFile != nil {
 			defer logFile.Close()
+			options.logf = func(format string, args ...any) {
+				logDaemonf(logFile, format, args...)
+			}
 		}
 		runSyncLoop(runOnce, options.state, logFile)
 		return
+	}
+
+	options.logf = func(format string, args ...any) {
+		fmt.Printf(format+"\n", args...)
 	}
 
 	totalSessions, err := runOnce()
@@ -303,9 +311,15 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			}
 			sessions, maxUpdated = filterSessionsSince(sessions, since)
 			if len(sessions) == 0 {
+				if options.logf != nil {
+					options.logf("sync source=%s tool=%s sessions=%d", sourceName, toolName, 0)
+				}
 				continue
 			}
 		}
+	if options.logf != nil {
+		options.logf("sync source=%s tool=%s sessions=%d", sourceName, toolName, len(sessions))
+	}
 
 		payload := SyncPayload{
 			AgentID:  params.agentID,
@@ -780,6 +794,7 @@ type claudeEntry struct {
 	Modified    string `json:"modified"`
 	FirstPrompt string `json:"firstPrompt"`
 	ProjectPath string `json:"projectPath"`
+	MessageCount int   `json:"messageCount"`
 }
 
 func loadClaudeSessions(root string) ([]SyncSession, error) {
@@ -804,6 +819,9 @@ func loadClaudeSessions(root string) ([]SyncSession, error) {
 			if entry.SessionID == "" || entry.FullPath == "" {
 				continue
 			}
+			if isClaudeIndexProbe(entry) {
+				continue
+			}
 			session := SyncSession{
 				ID:        entry.SessionID,
 				Title:     entry.FirstPrompt,
@@ -811,7 +829,8 @@ func loadClaudeSessions(root string) ([]SyncSession, error) {
 				StartedAt: entry.Created,
 				EndedAt:   entry.Modified,
 			}
-			if ok := parseClaudeSession(entry.FullPath, &session); !ok {
+			ok, skip := parseClaudeSession(entry.FullPath, &session)
+			if !ok || skip {
 				continue
 			}
 			if session.TotalTokens == 0 && session.Model == "" {
@@ -825,6 +844,14 @@ func loadClaudeSessions(root string) ([]SyncSession, error) {
 	}
 
 	return sessions, nil
+}
+
+func isClaudeIndexProbe(entry claudeEntry) bool {
+	title := strings.TrimSpace(entry.FirstPrompt)
+	if strings.EqualFold(title, "what is 2+2?") && entry.MessageCount <= 2 && entry.ProjectPath == "/" {
+		return true
+	}
+	return false
 }
 
 func findClaudeIndexes(projectsDir string) ([]string, error) {
@@ -860,16 +887,19 @@ func parseClaudeIndex(path string) ([]claudeEntry, error) {
 	return idx.Entries, nil
 }
 
-func parseClaudeSession(filePath string, session *SyncSession) bool {
+func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	msgIndex := 0
+	userMessages := 0
+	assistantMessages := 0
+	authError := false
 	for scanner.Scan() {
 		lineText := strings.TrimSpace(scanner.Text())
 		if lineText == "" {
@@ -895,6 +925,15 @@ func parseClaudeSession(filePath string, session *SyncSession) bool {
 		if content == "" {
 			continue
 		}
+		if typeValue == "assistant" {
+			if isTrue(item["isApiErrorMessage"]) || stringFrom(item["error"]) == "authentication_failed" {
+				authError = true
+			}
+			lower := strings.ToLower(content)
+			if strings.Contains(lower, "invalid api key") || strings.Contains(lower, "please run /login") {
+				authError = true
+			}
+		}
 		timestamp := stringFrom(item["timestamp"])
 		session.Messages = append(session.Messages, SyncMessage{
 			Index:     msgIndex,
@@ -903,6 +942,11 @@ func parseClaudeSession(filePath string, session *SyncSession) bool {
 			Timestamp: timestamp,
 		})
 		msgIndex++
+		if typeValue == "user" {
+			userMessages++
+		} else {
+			assistantMessages++
+		}
 
 		if typeValue == "assistant" {
 			model := stringFrom(message["model"])
@@ -917,7 +961,15 @@ func parseClaudeSession(filePath string, session *SyncSession) bool {
 		}
 	}
 
-	return session.ID != ""
+	if session.ID == "" {
+		return false, false
+	}
+
+	if authError && (userMessages+assistantMessages) <= 2 && session.TotalTokens == 0 {
+		return true, true
+	}
+
+	return true, false
 }
 
 func loadGeminiSessions(root string) ([]SyncSession, error) {
@@ -2207,6 +2259,20 @@ func intFrom(value any, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func isTrue(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i != 0
+		}
+	}
+	return false
 }
 
 func int64From(value any, fallback int64) int64 {
