@@ -109,6 +109,7 @@ func main() {
 	}
 
 	extraArgs := flag.Args()
+	forceDaemonStart := false
 	if len(extraArgs) > 0 {
 		switch extraArgs[0] {
 		case "status":
@@ -121,13 +122,15 @@ func main() {
 			}
 			fmt.Println("yiduo sync daemon stopped")
 			return
+		case "start":
+			forceDaemonStart = true
 		default:
 			fmt.Fprintf(os.Stderr, "unknown command: %s\n", extraArgs[0])
 			os.Exit(2)
 		}
 	}
 
-	daemonEnabled := *daemon || *daemonShort
+	daemonEnabled := *daemon || *daemonShort || forceDaemonStart
 	daemonWorker := daemonEnabled && os.Getenv(daemonEnv) != ""
 	if daemonEnabled && !daemonWorker {
 		if running, pid := daemonRunning(); running {
@@ -177,6 +180,9 @@ func main() {
 	}
 
 	runOnce := func() (int, error) {
+		if options.logf != nil {
+			options.logf("yiduo sync start")
+		}
 		return syncOnce(syncParams{
 			server:           resolvedServer,
 			deviceToken:      resolvedDeviceToken,
