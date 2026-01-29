@@ -814,6 +814,12 @@ func loadClaudeSessions(root string) ([]SyncSession, error) {
 			if ok := parseClaudeSession(entry.FullPath, &session); !ok {
 				continue
 			}
+			if session.TotalTokens == 0 && session.Model == "" {
+				title := strings.ToLower(strings.TrimSpace(session.Title))
+				if title == "what is 2+2?" || len(session.Messages) <= 2 {
+					continue
+				}
+			}
 			sessions = append(sessions, session)
 		}
 	}
