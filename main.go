@@ -7,10 +7,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -114,12 +112,6 @@ func main() {
 	forceDaemonStart := false
 	if len(extraArgs) > 0 {
 		switch extraArgs[0] {
-		case "screenshot", "screenshots":
-			if err := runScreenshotGallery(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to render screenshots: %v\n", err)
-				os.Exit(1)
-			}
-			return
 		case "status":
 			printDaemonStatus()
 			return
@@ -391,164 +383,6 @@ func runSyncLoop(runOnce func() (int, error), state *syncState, logFile *os.File
 		case <-ticker.C:
 		}
 	}
-}
-
-type screenshotItem struct {
-	path string
-	name string
-	ts   time.Time
-}
-
-func runScreenshotGallery() error {
-	root := expandUser("~/.yi/screenshots")
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return err
-	}
-
-	now := time.Now()
-	items := make([]screenshotItem, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		ext := strings.ToLower(filepath.Ext(name))
-		switch ext {
-		case ".png", ".jpg", ".jpeg", ".webp", ".gif":
-		default:
-			continue
-		}
-
-		ts, ok := parseScreenshotTimestamp(name)
-		if !ok {
-			if info, err := entry.Info(); err == nil {
-				ts = info.ModTime()
-			} else {
-				continue
-			}
-		}
-		if !sameLocalDay(ts, now) {
-			continue
-		}
-
-		items = append(items, screenshotItem{
-			path: filepath.Join(root, name),
-			name: name,
-			ts:   ts,
-		})
-	}
-
-	if len(items) == 0 {
-		return fmt.Errorf("no screenshots found for %s in %s", now.Format("2006-01-02"), root)
-	}
-
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].ts.Before(items[j].ts)
-	})
-
-	var b strings.Builder
-	b.WriteString("<!doctype html><html><head><meta charset=\"utf-8\">")
-	b.WriteString("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
-	b.WriteString("<title>Yi Screenshots</title>")
-	b.WriteString("<style>")
-	b.WriteString("body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;margin:24px;background:#f7f7f8;color:#111}")
-	b.WriteString(".header{display:flex;align-items:baseline;gap:12px;margin-bottom:16px}")
-	b.WriteString(".title{font-size:20px;font-weight:600}")
-	b.WriteString(".meta{font-size:12px;color:#666}")
-	b.WriteString(".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}")
-	b.WriteString(".card{background:#fff;border:1px solid #e6e6e9;border-radius:10px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,0.04)}")
-	b.WriteString(".thumb{width:100%;height:160px;object-fit:cover;display:block}")
-	b.WriteString(".info{padding:8px 10px;font-size:12px;color:#555;display:flex;justify-content:space-between;gap:8px}")
-	b.WriteString("a{color:inherit;text-decoration:none}")
-	b.WriteString("</style></head><body>")
-
-	b.WriteString("<div class=\"header\">")
-	b.WriteString("<div class=\"title\">Today's Screenshots</div>")
-	b.WriteString("<div class=\"meta\">")
-	b.WriteString(html.EscapeString(now.Format("2006-01-02")))
-	b.WriteString(" · ")
-	b.WriteString(fmt.Sprintf("%d items", len(items)))
-	b.WriteString("</div></div>")
-
-	b.WriteString("<div class=\"grid\">")
-	for _, item := range items {
-		imgURL := fileURL(item.path)
-		b.WriteString("<div class=\"card\">")
-		b.WriteString("<a href=\"")
-		b.WriteString(imgURL)
-		b.WriteString("\" target=\"_blank\">")
-		b.WriteString("<img class=\"thumb\" loading=\"lazy\" src=\"")
-		b.WriteString(imgURL)
-		b.WriteString("\" alt=\"")
-		b.WriteString(html.EscapeString(item.name))
-		b.WriteString("\"></a>")
-		b.WriteString("<div class=\"info\"><span>")
-		b.WriteString(html.EscapeString(item.ts.Format("15:04:05")))
-		b.WriteString("</span><span>")
-		b.WriteString(html.EscapeString(item.name))
-		b.WriteString("</span></div>")
-		b.WriteString("</div>")
-	}
-	b.WriteString("</div></body></html>")
-
-	outPath := filepath.Join(root, "yi-screenshots-"+now.Format("20060102")+".html")
-	if err := os.WriteFile(outPath, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-
-	if err := openInBrowser(outPath); err != nil {
-		return err
-	}
-	return nil
-}
-
-func parseScreenshotTimestamp(name string) (time.Time, bool) {
-	if !strings.HasPrefix(name, "screen_") {
-		return time.Time{}, false
-	}
-	parts := strings.Split(name, "_")
-	if len(parts) < 3 {
-		return time.Time{}, false
-	}
-	datePart := parts[1]
-	timePart := parts[2]
-	if len(datePart) != 8 || len(timePart) < 6 {
-		return time.Time{}, false
-	}
-	ts, err := time.ParseInLocation("20060102150405", datePart+timePart[:6], time.Local)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return ts, true
-}
-
-func sameLocalDay(a, b time.Time) bool {
-	ay, am, ad := a.Date()
-	by, bm, bd := b.Date()
-	return ay == by && am == bm && ad == bd
-}
-
-func fileURL(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		abs = path
-	}
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}
-	return u.String()
-}
-
-func openInBrowser(path string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", path)
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", path)
-	default:
-		cmd = exec.Command("xdg-open", path)
-	}
-	return cmd.Start()
 }
 
 func filterSessionsSince(sessions []SyncSession, since time.Time) ([]SyncSession, time.Time) {
