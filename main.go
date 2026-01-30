@@ -52,10 +52,15 @@ type SyncSession struct {
 }
 
 type SyncMessage struct {
-	Index     int    `json:"index"`
-	Role      string `json:"role"`
-	Content   string `json:"content"`
-	Timestamp string `json:"timestamp"`
+	Index             int    `json:"index"`
+	Role              string `json:"role"`
+	Content           string `json:"content"`
+	Timestamp         string `json:"timestamp"`
+	InputTokens       int    `json:"input_tokens,omitempty"`
+	OutputTokens      int    `json:"output_tokens,omitempty"`
+	CachedInputTokens int    `json:"cached_input_tokens,omitempty"`
+	ReasoningTokens   int    `json:"reasoning_tokens,omitempty"`
+	TotalTokens       int    `json:"total_tokens,omitempty"`
 }
 
 type tokenTotals struct {
@@ -941,12 +946,12 @@ func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
 			}
 		}
 		timestamp := stringFrom(item["timestamp"])
-		session.Messages = append(session.Messages, SyncMessage{
+		msg := SyncMessage{
 			Index:     msgIndex,
 			Role:      role,
 			Content:   content,
 			Timestamp: timestamp,
-		})
+		}
 		msgIndex++
 		if typeValue == "user" {
 			userMessages++
@@ -960,11 +965,22 @@ func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
 				session.Model = model
 			}
 			usage := mapFrom(message["usage"])
-			session.TotalInputTokens += intFrom(usage["input_tokens"], 0)
-			session.TotalOutputTokens += intFrom(usage["output_tokens"], 0)
-			session.TotalCachedInputTokens += intFrom(usage["cache_read_input_tokens"], 0)
+			inputTokens := intFrom(usage["input_tokens"], 0)
+			outputTokens := intFrom(usage["output_tokens"], 0)
+			cachedInputTokens := intFrom(usage["cache_read_input_tokens"], 0)
+			reasoningTokens := intFrom(usage["reasoning_output_tokens"], 0)
+			msg.InputTokens = inputTokens
+			msg.OutputTokens = outputTokens
+			msg.CachedInputTokens = cachedInputTokens
+			msg.ReasoningTokens = reasoningTokens
+			msg.TotalTokens = inputTokens + outputTokens + cachedInputTokens + reasoningTokens
+			session.TotalInputTokens += inputTokens
+			session.TotalOutputTokens += outputTokens
+			session.TotalCachedInputTokens += cachedInputTokens
+			session.TotalReasoningTokens += reasoningTokens
 			session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
 		}
+		session.Messages = append(session.Messages, msg)
 	}
 
 	if session.ID == "" {
@@ -1059,12 +1075,24 @@ func parseGeminiSession(path string) (SyncSession, bool) {
 			if session.Title == "" && role == "user" {
 				session.Title = content
 			}
-			session.Messages = append(session.Messages, SyncMessage{
+			message := SyncMessage{
 				Index:     msgIndex,
 				Role:      role,
 				Content:   content,
 				Timestamp: msg.Timestamp,
-			})
+			}
+			if msg.Tokens != nil {
+				message.InputTokens = msg.Tokens.Input
+				message.OutputTokens = msg.Tokens.Output
+				message.CachedInputTokens = msg.Tokens.Cached
+				message.ReasoningTokens = msg.Tokens.Thoughts
+				if msg.Tokens.Total > 0 {
+					message.TotalTokens = msg.Tokens.Total
+				} else {
+					message.TotalTokens = msg.Tokens.Input + msg.Tokens.Output + msg.Tokens.Cached + msg.Tokens.Thoughts
+				}
+			}
+			session.Messages = append(session.Messages, message)
 			msgIndex++
 		}
 		if msg.Model != "" {
