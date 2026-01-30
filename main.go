@@ -2107,11 +2107,44 @@ func parseMessageContent(value any) string {
 		if !ok {
 			continue
 		}
-		text, ok := entry["text"].(string)
-		if !ok {
-			continue
+		entryType := stringFrom(entry["type"])
+		switch entryType {
+		case "text":
+			if text := stringFrom(entry["text"]); text != "" {
+				parts = append(parts, text)
+			}
+		case "tool_use":
+			name := stringFrom(entry["name"])
+			input := entry["input"]
+			inputText := stringifyJSON(input)
+			if inputText == "" {
+				if name != "" {
+					parts = append(parts, fmt.Sprintf("[tool_use] %s", name))
+				} else {
+					parts = append(parts, "[tool_use]")
+				}
+			} else if name != "" {
+				parts = append(parts, fmt.Sprintf("[tool_use] %s\n%s", name, inputText))
+			} else {
+				parts = append(parts, fmt.Sprintf("[tool_use]\n%s", inputText))
+			}
+		case "tool_result":
+			content := entry["content"]
+			contentText := stringifyJSON(content)
+			if contentText == "" {
+				contentText = stringFrom(content)
+			}
+			if contentText != "" {
+				parts = append(parts, fmt.Sprintf("[tool_result]\n%s", contentText))
+			} else {
+				parts = append(parts, "[tool_result]")
+			}
+		default:
+			// Fallback: include any inline text we can extract.
+			if text := stringFrom(entry["text"]); text != "" {
+				parts = append(parts, text)
+			}
 		}
-		parts = append(parts, text)
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
 }
