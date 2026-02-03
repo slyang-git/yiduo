@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -1730,6 +1731,18 @@ func firstStringFromMap(payload map[string]any, keys ...string) string {
 }
 
 func loadCursorSessions(root string) ([]SyncSession, error) {
+	trackingSessions, err := loadCursorTrackingSessions(root)
+	if err != nil {
+		trackingSessions = nil
+	}
+	chatSessions, err := loadCursorChatSessions(root)
+	if err != nil {
+		chatSessions = nil
+	}
+	return append(trackingSessions, chatSessions...), nil
+}
+
+func loadCursorTrackingSessions(root string) ([]SyncSession, error) {
 	dbPath := filepath.Join(root, "ai-tracking", "ai-code-tracking.db")
 	if _, err := os.Stat(dbPath); err != nil {
 		return []SyncSession{}, nil
@@ -1770,6 +1783,294 @@ func loadCursorSessions(root string) ([]SyncSession, error) {
 		sessions = append(sessions, session)
 	}
 	return sessions, nil
+}
+
+type cursorChatMeta struct {
+	AgentID         string `json:"agentId"`
+	LatestRootBlob  string `json:"latestRootBlobId"`
+	Name            string `json:"name"`
+	Mode            string `json:"mode"`
+	CreatedAt       int64  `json:"createdAt"`
+	LastUsedModel   string `json:"lastUsedModel"`
+}
+
+type cursorChatMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
+func loadCursorChatSessions(root string) ([]SyncSession, error) {
+	chatsRoot := filepath.Join(root, "chats")
+	info, err := os.Stat(chatsRoot)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return []SyncSession{}, nil
+	}
+
+	storePaths := []string{}
+	err = filepath.WalkDir(chatsRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if d.Name() != "store.db" {
+			return nil
+		}
+		storePaths = append(storePaths, path)
+		return nil
+	})
+	if err != nil {
+		return []SyncSession{}, nil
+	}
+
+	var sessions []SyncSession
+	for _, dbPath := range storePaths {
+		session, ok := parseCursorChatStore(dbPath)
+		if ok {
+			sessions = append(sessions, session)
+		}
+	}
+	return sessions, nil
+}
+
+func parseCursorChatStore(dbPath string) (SyncSession, bool) {
+	metaHex, err := sqliteScalar(dbPath, "SELECT value FROM meta WHERE key='0'")
+	if err != nil || metaHex == "" {
+		return SyncSession{}, false
+	}
+	metaBytes, err := hex.DecodeString(strings.TrimSpace(metaHex))
+	if err != nil {
+		return SyncSession{}, false
+	}
+	var meta cursorChatMeta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return SyncSession{}, false
+	}
+	if meta.AgentID == "" || meta.LatestRootBlob == "" {
+		return SyncSession{}, false
+	}
+
+	rootHex, err := sqliteScalar(dbPath, fmt.Sprintf("SELECT hex(data) FROM blobs WHERE id='%s'", meta.LatestRootBlob))
+	if err != nil || rootHex == "" {
+		return SyncSession{}, false
+	}
+	rootBytes, err := hex.DecodeString(strings.TrimSpace(rootHex))
+	if err != nil {
+		return SyncSession{}, false
+	}
+	blobIDs := parseCursorRootBlobIDs(rootBytes)
+	if len(blobIDs) == 0 {
+		return SyncSession{}, false
+	}
+
+	messageByID := make(map[string]cursorChatMessage, len(blobIDs))
+	for _, chunk := range chunkStrings(blobIDs, 200) {
+		rows, err := sqliteRows(dbPath, fmt.Sprintf("SELECT id, hex(data) FROM blobs WHERE id IN (%s)", quoteStrings(chunk)))
+		if err != nil {
+			continue
+		}
+		for _, row := range rows {
+			if len(row) < 2 {
+				continue
+			}
+			dataBytes, err := hex.DecodeString(strings.TrimSpace(row[1]))
+			if err != nil {
+				continue
+			}
+			var msg cursorChatMessage
+			if err := json.Unmarshal(dataBytes, &msg); err != nil {
+				continue
+			}
+			if msg.Role == "" {
+				continue
+			}
+			messageByID[row[0]] = msg
+		}
+	}
+
+	startedAt := formatMillis(meta.CreatedAt)
+	endedAt := ""
+	if stat, err := os.Stat(dbPath); err == nil {
+		endedAt = stat.ModTime().UTC().Format(time.RFC3339)
+	}
+	if startedAt == "" {
+		startedAt = endedAt
+	}
+	if endedAt == "" {
+		endedAt = startedAt
+	}
+
+	session := SyncSession{
+		ID:        "cursor-chat:" + meta.AgentID,
+		Title:     strings.TrimSpace(meta.Name),
+		Model:     strings.TrimSpace(meta.LastUsedModel),
+		StartedAt: startedAt,
+		EndedAt:   endedAt,
+	}
+	if session.Title == "" {
+		session.Title = session.ID
+	}
+
+	index := 0
+	for _, id := range blobIDs {
+		msg, ok := messageByID[id]
+		if !ok {
+			continue
+		}
+		content := cursorContentToString(msg.Content)
+		if session.Cwd == "" {
+			if cwd := extractCursorWorkspacePath(content); cwd != "" {
+				session.Cwd = normalizeCwd(cwd)
+			}
+			if session.Cwd == "" {
+				if cwd := extractWorkspaceDirectory(content); cwd != "" {
+					session.Cwd = normalizeCwd(cwd)
+				}
+			}
+		}
+		if content == "" {
+			continue
+		}
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:   index,
+			Role:    msg.Role,
+			Content: content,
+		})
+		index++
+	}
+
+	if session.Title == session.ID && session.Cwd != "" {
+		session.Title = session.Cwd
+	}
+	return session, session.ID != ""
+}
+
+func sqliteScalar(dbPath string, query string) (string, error) {
+	cmd := exec.Command("sqlite3", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func sqliteRows(dbPath string, query string) ([][]string, error) {
+	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, query)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	rows := make([][]string, 0)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		rows = append(rows, strings.Split(line, "\t"))
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func parseCursorRootBlobIDs(data []byte) []string {
+	ids := make([]string, 0, len(data)/34)
+	for i := 0; i+2 <= len(data); {
+		if data[i] == 0x0a && data[i+1] == 0x20 {
+			start := i + 2
+			end := start + 32
+			if end > len(data) {
+				break
+			}
+			ids = append(ids, hex.EncodeToString(data[start:end]))
+			i = end
+			continue
+		}
+		i++
+	}
+	return ids
+}
+
+func cursorContentToString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, item := range v {
+			switch part := item.(type) {
+			case string:
+				b.WriteString(part)
+			case map[string]any:
+				if text, ok := part["text"].(string); ok {
+					b.WriteString(text)
+					continue
+				}
+				if text, ok := part["content"].(string); ok {
+					b.WriteString(text)
+					continue
+				}
+				if raw, err := json.Marshal(part); err == nil {
+					b.WriteString(string(raw))
+				}
+			default:
+				if raw, err := json.Marshal(part); err == nil {
+					b.WriteString(string(raw))
+				}
+			}
+		}
+		return b.String()
+	default:
+		if raw, err := json.Marshal(v); err == nil {
+			return string(raw)
+		}
+	}
+	return ""
+}
+
+func extractCursorWorkspacePath(content string) string {
+	needle := "Workspace Path:"
+	if idx := strings.Index(content, needle); idx != -1 {
+		trimmed := strings.TrimSpace(content[idx+len(needle):])
+		if trimmed == "" {
+			return ""
+		}
+		if end := strings.Index(trimmed, "\n"); end != -1 {
+			return strings.TrimSpace(trimmed[:end])
+		}
+		return strings.TrimSpace(trimmed)
+	}
+	return ""
+}
+
+func chunkStrings(values []string, size int) [][]string {
+	if size <= 0 || len(values) == 0 {
+		return nil
+	}
+	chunks := make([][]string, 0, (len(values)+size-1)/size)
+	for i := 0; i < len(values); i += size {
+		end := i + size
+		if end > len(values) {
+			end = len(values)
+		}
+		chunks = append(chunks, values[i:end])
+	}
+	return chunks
+}
+
+func quoteStrings(values []string) string {
+	if len(values) == 0 {
+		return "''"
+	}
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		safe := strings.ReplaceAll(value, "'", "''")
+		quoted = append(quoted, "'"+safe+"'")
+	}
+	return strings.Join(quoted, ",")
 }
 
 func loadAmpSessions(root string) ([]SyncSession, error) {
