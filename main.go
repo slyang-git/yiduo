@@ -105,7 +105,7 @@ func main() {
 	kiloRoot := flag.String("kilocode-root", envOrDefault("KILOCODE_ROOT", "~/.kilocode"), "KiloCode root")
 	cursorRoot := flag.String("cursor-root", envOrDefault("CURSOR_ROOT", "~/.cursor"), "Cursor root")
 	ampRoot := flag.String("amp-root", envOrDefault("AMP_ROOT", "~/.amp"), "Amp root")
-	opencodeRoot := flag.String("opencode-root", envOrDefault("OPENCODE_ROOT", "~/.opencode"), "OpenCode root")
+	opencodeRoot := flag.String("opencode-root", envOrDefault("OPENCODE_ROOT", "~/.local/share/opencode"), "OpenCode root")
 	antigravityRoot := flag.String("antigravity-root", envOrDefault("ANTIGRAVITY_ROOT", "~/.gemini/antigravity"), "Antigravity root")
 	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
 	agentID := flag.String("agent-id", "local", "agent id")
@@ -190,25 +190,26 @@ func main() {
 			options.logf("yiduo sync start")
 		}
 		return syncOnce(syncParams{
-			server:           resolvedServer,
-			deviceToken:      resolvedDeviceToken,
-			deviceInfo:       deviceInfo,
-			agentID:          *agentID,
-			host:             *host,
-			toolOverride:     toolOverride,
-			sources:          sources,
-			codexRoot:        expandUser(*codexRoot),
-			claudeRoot:       expandUser(*claudeRoot),
-			geminiRoot:       expandUser(*geminiRoot),
-			qwenRoot:         expandUser(*qwenRoot),
-			clineRoot:        expandUser(*clineRoot),
-			continueRoot:     expandUser(*continueRoot),
-			kiloRoot:         expandUser(*kiloRoot),
-			cursorRoot:       expandUser(*cursorRoot),
-			ampRoot:          expandUser(*ampRoot),
-			opencodeRoot:     expandUser(*opencodeRoot),
-			antigravityRoot:  expandUser(*antigravityRoot),
-			droidRoot:        expandUser(*droidRoot),
+			server:          resolvedServer,
+			deviceToken:     resolvedDeviceToken,
+			deviceInfo:      deviceInfo,
+			agentID:         *agentID,
+			host:            *host,
+			toolOverride:    toolOverride,
+			sources:         sources,
+			codexRoot:       expandUser(*codexRoot),
+			claudeRoot:      expandUser(*claudeRoot),
+			geminiRoot:      expandUser(*geminiRoot),
+			qwenRoot:        expandUser(*qwenRoot),
+			clineRoot:       expandUser(*clineRoot),
+			continueRoot:    expandUser(*continueRoot),
+			kiloRoot:        expandUser(*kiloRoot),
+			cursorRoot:      expandUser(*cursorRoot),
+			ampRoot:         expandUser(*ampRoot),
+			opencodeRoot:    expandUser(*opencodeRoot),
+			antigravityRoot: expandUser(*antigravityRoot),
+			droidRoot:       expandUser(*droidRoot),
+			logf:            options.logf,
 		}, options)
 	}
 
@@ -267,6 +268,7 @@ type syncParams struct {
 	opencodeRoot    string
 	antigravityRoot string
 	droidRoot       string
+	logf            func(format string, args ...any)
 }
 
 func syncOnce(params syncParams, options syncOptions) (int, error) {
@@ -295,7 +297,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 		case "kilocode":
 			sessions, err = loadKiloCodeSessions(params.kiloRoot)
 		case "cursor":
-			sessions, err = loadCursorSessions(params.cursorRoot)
+			sessions, err = loadCursorSessions(params.cursorRoot, params.logf)
 		case "amp":
 			sessions, err = loadAmpSessions(params.ampRoot)
 		case "opencode":
@@ -329,9 +331,9 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 				continue
 			}
 		}
-	if options.logf != nil {
-		options.logf("sync source=%s tool=%s sessions=%d", sourceName, toolName, len(sessions))
-	}
+		if options.logf != nil {
+			options.logf("sync source=%s tool=%s sessions=%d", sourceName, toolName, len(sessions))
+		}
 
 		payload := SyncPayload{
 			AgentID:  params.agentID,
@@ -800,13 +802,13 @@ type claudeIndex struct {
 }
 
 type claudeEntry struct {
-	SessionID   string `json:"sessionId"`
-	FullPath    string `json:"fullPath"`
-	Created     string `json:"created"`
-	Modified    string `json:"modified"`
-	FirstPrompt string `json:"firstPrompt"`
-	ProjectPath string `json:"projectPath"`
-	MessageCount int   `json:"messageCount"`
+	SessionID    string `json:"sessionId"`
+	FullPath     string `json:"fullPath"`
+	Created      string `json:"created"`
+	Modified     string `json:"modified"`
+	FirstPrompt  string `json:"firstPrompt"`
+	ProjectPath  string `json:"projectPath"`
+	MessageCount int    `json:"messageCount"`
 }
 
 func loadClaudeSessions(root string) ([]SyncSession, error) {
@@ -1316,11 +1318,11 @@ func loadClineSessions(root string) ([]SyncSession, error) {
 		ts := int64From(item["ts"], 0)
 		startedAt := formatMillis(ts)
 		session := SyncSession{
-			ID:        id,
-			Title:     stringFrom(item["task"]),
-			Cwd:       stringFrom(item["cwdOnTaskInitialization"]),
-			StartedAt: startedAt,
-			EndedAt:   startedAt,
+			ID:                     id,
+			Title:                  stringFrom(item["task"]),
+			Cwd:                    stringFrom(item["cwdOnTaskInitialization"]),
+			StartedAt:              startedAt,
+			EndedAt:                startedAt,
 			TotalInputTokens:       intFrom(item["tokensIn"], 0),
 			TotalOutputTokens:      intFrom(item["tokensOut"], 0),
 			TotalCachedInputTokens: intFrom(item["cacheReads"], 0),
@@ -1379,14 +1381,14 @@ func loadContinueSessions(root string) ([]SyncSession, error) {
 }
 
 type continueHistory struct {
-	Message    map[string]any `json:"message"`
+	Message    map[string]any   `json:"message"`
 	PromptLogs []map[string]any `json:"promptLogs"`
 }
 
 type continueSession struct {
-	SessionID          string           `json:"sessionId"`
-	Title              string           `json:"title"`
-	WorkspaceDirectory string           `json:"workspaceDirectory"`
+	SessionID          string            `json:"sessionId"`
+	Title              string            `json:"title"`
+	WorkspaceDirectory string            `json:"workspaceDirectory"`
 	History            []continueHistory `json:"history"`
 }
 
@@ -1499,11 +1501,11 @@ type kiloUiMessage struct {
 }
 
 type kiloUsage struct {
-	TokensIn   int     `json:"tokensIn"`
-	TokensOut  int     `json:"tokensOut"`
-	CacheReads int     `json:"cacheReads"`
-	CacheWrites int    `json:"cacheWrites"`
-	Cost       float64 `json:"cost"`
+	TokensIn    int     `json:"tokensIn"`
+	TokensOut   int     `json:"tokensOut"`
+	CacheReads  int     `json:"cacheReads"`
+	CacheWrites int     `json:"cacheWrites"`
+	Cost        float64 `json:"cost"`
 }
 
 func loadKiloCodeSessions(root string) ([]SyncSession, error) {
@@ -1730,30 +1732,86 @@ func firstStringFromMap(payload map[string]any, keys ...string) string {
 	return ""
 }
 
-func loadCursorSessions(root string) ([]SyncSession, error) {
-	trackingSessions, err := loadCursorTrackingSessions(root)
+func loadCursorSessions(root string, logf func(format string, args ...any)) ([]SyncSession, error) {
+	logCursorf(logf, "cursor: root=%s", root)
+	trackingSessions, err := loadCursorTrackingSessions(root, logf)
 	if err != nil {
+		logCursorf(logf, "cursor: tracking error: %v", err)
 		trackingSessions = nil
 	}
-	chatSessions, err := loadCursorChatSessions(root)
+	chatSessions, err := loadCursorChatSessions(root, logf)
 	if err != nil {
+		logCursorf(logf, "cursor: chat error: %v", err)
 		chatSessions = nil
 	}
+	logCursorf(logf, "cursor: tracking sessions=%d chat sessions=%d", len(trackingSessions), len(chatSessions))
 	return append(trackingSessions, chatSessions...), nil
 }
 
-func loadCursorTrackingSessions(root string) ([]SyncSession, error) {
+func logCursorf(logf func(format string, args ...any), format string, args ...any) {
+	if logf == nil {
+		return
+	}
+	logf(format, args...)
+}
+
+func logCursorSchema(logf func(format string, args ...any), dbPath string, prefix string) {
+	if logf == nil {
+		return
+	}
+	tables, err := sqliteRows(dbPath, "SELECT name FROM sqlite_master WHERE type='table'")
+	if err != nil {
+		logCursorf(logf, "%s schema error: %v", prefix, err)
+		return
+	}
+	tableNames := make([]string, 0, len(tables))
+	for _, row := range tables {
+		if len(row) == 0 {
+			continue
+		}
+		tableNames = append(tableNames, row[0])
+	}
+	logCursorf(logf, "%s tables=%v", prefix, tableNames)
+
+	tokenColumns := make([]string, 0)
+	for _, table := range tableNames {
+		cols, err := sqliteRows(dbPath, fmt.Sprintf("PRAGMA table_info(%s)", table))
+		if err != nil {
+			continue
+		}
+		for _, col := range cols {
+			if len(col) < 2 {
+				continue
+			}
+			colName := strings.ToLower(col[1])
+			if strings.Contains(colName, "token") {
+				tokenColumns = append(tokenColumns, fmt.Sprintf("%s.%s", table, col[1]))
+			}
+		}
+	}
+	if len(tokenColumns) == 0 {
+		logCursorf(logf, "%s token columns not found", prefix)
+	} else {
+		logCursorf(logf, "%s token columns=%v", prefix, tokenColumns)
+	}
+}
+
+func loadCursorTrackingSessions(root string, logf func(format string, args ...any)) ([]SyncSession, error) {
 	dbPath := filepath.Join(root, "ai-tracking", "ai-code-tracking.db")
 	if _, err := os.Stat(dbPath); err != nil {
+		logCursorf(logf, "cursor: tracking db missing at %s", dbPath)
 		return []SyncSession{}, nil
 	}
 	if _, err := exec.LookPath("sqlite3"); err != nil {
+		logCursorf(logf, "cursor: sqlite3 not found; skip tracking")
 		return []SyncSession{}, nil
 	}
+	logCursorSchema(logf, dbPath, "cursor: tracking")
 
 	cmd := exec.Command("sqlite3", "-separator", "\t", dbPath, "SELECT conversationId, title, model, updatedAt FROM conversation_summaries")
 	output, err := cmd.Output()
 	if err != nil {
+		logCursorf(logf, "cursor: tracking sqlite error: %v", err)
 		return []SyncSession{}, nil
 	}
 
@@ -1782,16 +1840,17 @@ func loadCursorTrackingSessions(root string) ([]SyncSession, error) {
 		}
 		sessions = append(sessions, session)
 	}
+	logCursorf(logf, "cursor: tracking parsed sessions=%d", len(sessions))
 	return sessions, nil
 }
 
 type cursorChatMeta struct {
-	AgentID         string `json:"agentId"`
-	LatestRootBlob  string `json:"latestRootBlobId"`
-	Name            string `json:"name"`
-	Mode            string `json:"mode"`
-	CreatedAt       int64  `json:"createdAt"`
-	LastUsedModel   string `json:"lastUsedModel"`
+	AgentID        string `json:"agentId"`
+	LatestRootBlob string `json:"latestRootBlobId"`
+	Name           string `json:"name"`
+	Mode           string `json:"mode"`
+	CreatedAt      int64  `json:"createdAt"`
+	LastUsedModel  string `json:"lastUsedModel"`
 }
 
 type cursorChatMessage struct {
@@ -1799,13 +1858,15 @@ type cursorChatMessage struct {
 	Content any    `json:"content"`
 }
 
-func loadCursorChatSessions(root string) ([]SyncSession, error) {
+func loadCursorChatSessions(root string, logf func(format string, args ...any)) ([]SyncSession, error) {
 	chatsRoot := filepath.Join(root, "chats")
 	info, err := os.Stat(chatsRoot)
 	if err != nil || !info.IsDir() {
+		logCursorf(logf, "cursor: chats dir missing at %s", chatsRoot)
 		return []SyncSession{}, nil
 	}
 	if _, err := exec.LookPath("sqlite3"); err != nil {
+		logCursorf(logf, "cursor: sqlite3 not found; skip chats")
 		return []SyncSession{}, nil
 	}
 
@@ -1821,46 +1882,57 @@ func loadCursorChatSessions(root string) ([]SyncSession, error) {
 		return nil
 	})
 	if err != nil {
+		logCursorf(logf, "cursor: chat walk error: %v", err)
 		return []SyncSession{}, nil
 	}
+	logCursorf(logf, "cursor: chat stores found=%d", len(storePaths))
 
 	var sessions []SyncSession
 	for _, dbPath := range storePaths {
-		session, ok := parseCursorChatStore(dbPath)
+		session, ok := parseCursorChatStore(dbPath, logf)
 		if ok {
 			sessions = append(sessions, session)
 		}
 	}
+	logCursorf(logf, "cursor: chat parsed sessions=%d", len(sessions))
 	return sessions, nil
 }
 
-func parseCursorChatStore(dbPath string) (SyncSession, bool) {
+func parseCursorChatStore(dbPath string, logf func(format string, args ...any)) (SyncSession, bool) {
+	logCursorSchema(logf, dbPath, "cursor: chat")
 	metaHex, err := sqliteScalar(dbPath, "SELECT value FROM meta WHERE key='0'")
 	if err != nil || metaHex == "" {
+		logCursorf(logf, "cursor: chat meta missing at %s", dbPath)
 		return SyncSession{}, false
 	}
 	metaBytes, err := hex.DecodeString(strings.TrimSpace(metaHex))
 	if err != nil {
+		logCursorf(logf, "cursor: chat meta decode error at %s: %v", dbPath, err)
 		return SyncSession{}, false
 	}
 	var meta cursorChatMeta
 	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		logCursorf(logf, "cursor: chat meta unmarshal error at %s: %v", dbPath, err)
 		return SyncSession{}, false
 	}
 	if meta.AgentID == "" || meta.LatestRootBlob == "" {
+		logCursorf(logf, "cursor: chat meta incomplete at %s", dbPath)
 		return SyncSession{}, false
 	}
 
 	rootHex, err := sqliteScalar(dbPath, fmt.Sprintf("SELECT hex(data) FROM blobs WHERE id='%s'", meta.LatestRootBlob))
 	if err != nil || rootHex == "" {
+		logCursorf(logf, "cursor: chat root blob missing at %s (id=%s)", dbPath, meta.LatestRootBlob)
 		return SyncSession{}, false
 	}
 	rootBytes, err := hex.DecodeString(strings.TrimSpace(rootHex))
 	if err != nil {
+		logCursorf(logf, "cursor: chat root blob decode error at %s: %v", dbPath, err)
 		return SyncSession{}, false
 	}
 	blobIDs := parseCursorRootBlobIDs(rootBytes)
 	if len(blobIDs) == 0 {
+		logCursorf(logf, "cursor: chat no message blob ids at %s", dbPath)
 		return SyncSession{}, false
 	}
 
@@ -1868,6 +1940,7 @@ func parseCursorChatStore(dbPath string) (SyncSession, bool) {
 	for _, chunk := range chunkStrings(blobIDs, 200) {
 		rows, err := sqliteRows(dbPath, fmt.Sprintf("SELECT id, hex(data) FROM blobs WHERE id IN (%s)", quoteStrings(chunk)))
 		if err != nil {
+			logCursorf(logf, "cursor: chat blob batch error at %s: %v", dbPath, err)
 			continue
 		}
 		for _, row := range rows {
@@ -1888,6 +1961,7 @@ func parseCursorChatStore(dbPath string) (SyncSession, bool) {
 			messageByID[row[0]] = msg
 		}
 	}
+	logCursorf(logf, "cursor: chat message blobs decoded=%d", len(messageByID))
 
 	startedAt := formatMillis(meta.CreatedAt)
 	endedAt := ""
@@ -1943,6 +2017,7 @@ func parseCursorChatStore(dbPath string) (SyncSession, bool) {
 	if session.Title == session.ID && session.Cwd != "" {
 		session.Title = session.Cwd
 	}
+	logCursorf(logf, "cursor: chat session id=%s title=%s messages=%d", session.ID, session.Title, len(session.Messages))
 	return session, session.ID != ""
 }
 
@@ -1962,6 +2037,8 @@ func sqliteRows(dbPath string, query string) ([][]string, error) {
 		return nil, err
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(output))
+	// Cursor blobs can be large; raise scan limit to avoid token too long.
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	rows := make([][]string, 0)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -2078,7 +2155,253 @@ func loadAmpSessions(root string) ([]SyncSession, error) {
 }
 
 func loadOpenCodeSessions(root string) ([]SyncSession, error) {
-	return []SyncSession{}, nil
+	dataRoot := filepath.Join(root, "storage")
+	sessionsDir := filepath.Join(dataRoot, "session")
+	partsDir := filepath.Join(dataRoot, "part")
+	projectsDir := filepath.Join(dataRoot, "project")
+
+	// Load projects map
+	projects := make(map[string]opencodeProject)
+	if err := loadOpenCodeProjects(projectsDir, projects); err != nil {
+		return nil, fmt.Errorf("failed to load projects: %v", err)
+	}
+
+	// Load sessions from session directory
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return []SyncSession{}, nil
+	}
+
+	var sessions []SyncSession
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		projectDir := filepath.Join(sessionsDir, entry.Name())
+		sessionFiles, err := os.ReadDir(projectDir)
+		if err != nil {
+			continue
+		}
+
+		for _, sessionFile := range sessionFiles {
+			if sessionFile.IsDir() || !strings.HasSuffix(sessionFile.Name(), ".json") {
+				continue
+			}
+
+			sessionPath := filepath.Join(projectDir, sessionFile.Name())
+			session, ok := parseOpenCodeSession(sessionPath, projects, partsDir)
+			if ok {
+				sessions = append(sessions, session)
+			}
+		}
+	}
+
+	// Sort sessions by start time
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+
+	return sessions, nil
+}
+
+func loadOpenCodeProjects(projectsDir string, projects map[string]opencodeProject) error {
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		projectPath := filepath.Join(projectsDir, entry.Name())
+		raw, err := os.ReadFile(projectPath)
+		if err != nil {
+			continue
+		}
+
+		var project opencodeProject
+		if err := json.Unmarshal(raw, &project); err != nil {
+			continue
+		}
+
+		if project.ID != "" {
+			projects[project.ID] = project
+		}
+	}
+
+	return nil
+}
+
+func parseOpenCodeSession(sessionPath string, projects map[string]opencodeProject, partsDir string) (SyncSession, bool) {
+	raw, err := os.ReadFile(sessionPath)
+	if err != nil {
+		return SyncSession{}, false
+	}
+
+	var sess opencodeSession
+	if err := json.Unmarshal(raw, &sess); err != nil {
+		return SyncSession{}, false
+	}
+
+	if sess.ID == "" {
+		return SyncSession{}, false
+	}
+
+	startedAt := formatMillis(sess.Time.Created)
+	endedAt := formatMillis(sess.Time.Updated)
+	if endedAt == "" {
+		if stat, err := os.Stat(sessionPath); err == nil {
+			endedAt = stat.ModTime().UTC().Format(time.RFC3339)
+		}
+	}
+
+	session := SyncSession{
+		ID:        sess.ID,
+		Title:     sess.Title,
+		StartedAt: startedAt,
+		EndedAt:   endedAt,
+	}
+
+	// Set directory from session or project
+	if sess.Directory != "" {
+		session.Cwd = normalizeCwd(sess.Directory)
+	} else if project, exists := projects[sess.ProjectID]; exists {
+		session.Cwd = normalizeCwd(project.Worktree)
+	}
+
+	// Load messages for this session
+	messages, err := loadOpenCodeMessages(sess.ID, partsDir)
+	if err == nil {
+		session.Messages = messages
+	}
+
+	// Set title if empty
+	if session.Title == "" {
+		session.Title = "OpenCode session"
+		if session.Cwd != "" {
+			session.Title = session.Cwd
+		}
+	}
+
+	return session, true
+}
+
+func loadOpenCodeMessages(sessionID string, partsDir string) ([]SyncMessage, error) {
+	// Find all message directories for this session
+	entries, err := os.ReadDir(partsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var messageDirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "msg_") {
+			continue
+		}
+
+		msgDir := filepath.Join(partsDir, entry.Name())
+		partFiles, err := os.ReadDir(msgDir)
+		if err != nil {
+			continue
+		}
+
+		// Check if any part belongs to this session
+		for _, partFile := range partFiles {
+			if partFile.IsDir() || !strings.HasSuffix(partFile.Name(), ".json") {
+				continue
+			}
+
+			partPath := filepath.Join(msgDir, partFile.Name())
+			raw, err := os.ReadFile(partPath)
+			if err != nil {
+				continue
+			}
+
+			var part opencodeMessage
+			if err := json.Unmarshal(raw, &part); err != nil {
+				continue
+			}
+
+			if part.SessionID == sessionID {
+				messageDirs = append(messageDirs, msgDir)
+				break
+			}
+		}
+	}
+
+	// Load all parts for each message and build messages
+	var messages []SyncMessage
+	messageIndex := 0
+
+	for _, msgDir := range messageDirs {
+		partFiles, err := os.ReadDir(msgDir)
+		if err != nil {
+			continue
+		}
+
+		var msgParts []opencodeMessage
+		var msgTime opencodeTime
+		var msgRole string
+		var msgContent string
+
+		for _, partFile := range partFiles {
+			if partFile.IsDir() || !strings.HasSuffix(partFile.Name(), ".json") {
+				continue
+			}
+
+			partPath := filepath.Join(msgDir, partFile.Name())
+			raw, err := os.ReadFile(partPath)
+			if err != nil {
+				continue
+			}
+
+			var part opencodeMessage
+			if err := json.Unmarshal(raw, &part); err != nil {
+				continue
+			}
+
+			msgParts = append(msgParts, part)
+
+			// Extract role and content from parts
+			if part.Type == "text" && part.Text != "" {
+				msgContent = part.Text
+				if msgRole == "" {
+					msgRole = "user"
+				}
+			} else if part.Type == "tool" {
+				msgRole = "assistant"
+			}
+
+			// Update time
+			if part.Time.Start != 0 && (msgTime.Start == 0 || part.Time.Start < msgTime.Start) {
+				msgTime.Start = part.Time.Start
+			}
+			if part.Time.End != 0 && (msgTime.End == 0 || part.Time.End > msgTime.End) {
+				msgTime.End = part.Time.End
+			}
+		}
+
+		// Create message if we have content
+		if msgContent != "" {
+			timestamp := ""
+			if msgTime.Start != 0 {
+				timestamp = formatMillis(msgTime.Start)
+			}
+
+			messages = append(messages, SyncMessage{
+				Index:     messageIndex,
+				Role:      msgRole,
+				Content:   msgContent,
+				Timestamp: timestamp,
+			})
+			messageIndex++
+		}
+	}
+
+	return messages, nil
 }
 
 func loadAntigravitySessions(root string) ([]SyncSession, error) {
@@ -2113,6 +2436,63 @@ type antigravityMetadata struct {
 	Summary      string `json:"summary"`
 	UpdatedAt    string `json:"updatedAt"`
 	Version      string `json:"version"`
+}
+
+type opencodeProject struct {
+	ID       string       `json:"id"`
+	Worktree string       `json:"worktree"`
+	VCS      string       `json:"vcs"`
+	Time     opencodeTime `json:"time"`
+}
+
+type opencodeSession struct {
+	ID        string          `json:"id"`
+	Version   string          `json:"version"`
+	ProjectID string          `json:"projectID"`
+	Directory string          `json:"directory"`
+	ParentID  string          `json:"parentID,omitempty"`
+	Title     string          `json:"title"`
+	Time      opencodeTime    `json:"time"`
+	Summary   opencodeSummary `json:"summary"`
+}
+
+type opencodeMessage struct {
+	ID        string           `json:"id"`
+	SessionID string           `json:"sessionID"`
+	MessageID string           `json:"messageID"`
+	Type      string           `json:"type"`
+	Text      string           `json:"text,omitempty"`
+	CallID    string           `json:"callID,omitempty"`
+	Tool      string           `json:"tool,omitempty"`
+	Snapshot  string           `json:"snapshot,omitempty"`
+	State     opencodeState    `json:"state,omitempty"`
+	Title     string           `json:"title,omitempty"`
+	Metadata  opencodeMetadata `json:"metadata,omitempty"`
+	Time      opencodeTime     `json:"time,omitempty"`
+}
+
+type opencodeTime struct {
+	Created int64 `json:"created"`
+	Updated int64 `json:"updated"`
+	Start   int64 `json:"start,omitempty"`
+	End     int64 `json:"end,omitempty"`
+}
+
+type opencodeSummary struct {
+	Additions int `json:"additions"`
+	Deletions int `json:"deletions"`
+	Files     int `json:"files"`
+}
+
+type opencodeState struct {
+	Status string         `json:"status"`
+	Input  map[string]any `json:"input,omitempty"`
+	Output string         `json:"output,omitempty"`
+}
+
+type opencodeMetadata struct {
+	Count     int  `json:"count,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 func parseAntigravityMetadata(path string) (SyncSession, bool) {
@@ -2167,11 +2547,11 @@ type droidMessage struct {
 }
 
 type droidTokenUsage struct {
-	InputTokens        int `json:"inputTokens"`
-	OutputTokens       int `json:"outputTokens"`
+	InputTokens         int `json:"inputTokens"`
+	OutputTokens        int `json:"outputTokens"`
 	CacheCreationTokens int `json:"cacheCreationTokens"`
-	CacheReadTokens    int `json:"cacheReadTokens"`
-	ThinkingTokens     int `json:"thinkingTokens"`
+	CacheReadTokens     int `json:"cacheReadTokens"`
+	ThinkingTokens      int `json:"thinkingTokens"`
 }
 
 type droidSettings struct {
