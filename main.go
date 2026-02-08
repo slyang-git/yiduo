@@ -92,7 +92,7 @@ func main() {
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
-	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|antigravity|droid (comma-separated)")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|antigravity|droid (comma-separated)")
 	deviceToken := flag.String("device-token", "", "device token for sync authentication")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
 	daemonShort := flag.Bool("d", false, "shorthand for --daemon")
@@ -104,8 +104,9 @@ func main() {
 	continueRoot := flag.String("continue-root", envOrDefault("CONTINUE_ROOT", "~/.continue"), "Continue root")
 	kiloRoot := flag.String("kilocode-root", envOrDefault("KILOCODE_ROOT", "~/.kilocode"), "KiloCode root")
 	cursorRoot := flag.String("cursor-root", envOrDefault("CURSOR_ROOT", "~/.cursor"), "Cursor root")
-	ampRoot := flag.String("amp-root", envOrDefault("AMP_ROOT", "~/.amp"), "Amp root")
+	ampRoot := flag.String("amp-root", envOrDefault("AMP_ROOT", "~/.local/share/amp"), "Amp root")
 	opencodeRoot := flag.String("opencode-root", envOrDefault("OPENCODE_ROOT", "~/.local/share/opencode"), "OpenCode root")
+	piRoot := flag.String("pi-root", envOrDefault("PI_ROOT", "~/.pi"), "PI root")
 	antigravityRoot := flag.String("antigravity-root", envOrDefault("ANTIGRAVITY_ROOT", "~/.gemini/antigravity"), "Antigravity root")
 	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
 	agentID := flag.String("agent-id", "local", "agent id")
@@ -207,6 +208,7 @@ func main() {
 			cursorRoot:      expandUser(*cursorRoot),
 			ampRoot:         expandUser(*ampRoot),
 			opencodeRoot:    expandUser(*opencodeRoot),
+			piRoot:          expandUser(*piRoot),
 			antigravityRoot: expandUser(*antigravityRoot),
 			droidRoot:       expandUser(*droidRoot),
 			logf:            options.logf,
@@ -266,6 +268,7 @@ type syncParams struct {
 	cursorRoot      string
 	ampRoot         string
 	opencodeRoot    string
+	piRoot          string
 	antigravityRoot string
 	droidRoot       string
 	logf            func(format string, args ...any)
@@ -302,6 +305,8 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			sessions, err = loadAmpSessions(params.ampRoot)
 		case "opencode":
 			sessions, err = loadOpenCodeSessions(params.opencodeRoot)
+		case "pi":
+			sessions, err = loadPiSessions(params.piRoot)
 		case "antigravity":
 			sessions, err = loadAntigravitySessions(params.antigravityRoot)
 		case "droid":
@@ -1161,24 +1166,51 @@ type qwenMessage struct {
 
 func loadQwenSessions(root string) ([]SyncSession, error) {
 	tmpDir := filepath.Join(root, "tmp")
-	info, err := os.Stat(tmpDir)
-	if err != nil || !info.IsDir() {
+	projectsDir := filepath.Join(root, "projects")
+	merged := map[string]SyncSession{}
+
+	if info, err := os.Stat(tmpDir); err == nil && info.IsDir() {
+		logs, err := findQwenLogs(tmpDir)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range logs {
+			items, err := parseQwenLog(path)
+			if err != nil {
+				continue
+			}
+			for _, item := range items {
+				merged[item.ID] = pickBetterQwenSession(merged[item.ID], item)
+			}
+		}
+	}
+
+	if info, err := os.Stat(projectsDir); err == nil && info.IsDir() {
+		chats, err := findQwenChats(projectsDir)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range chats {
+			items, err := parseQwenChat(path)
+			if err != nil {
+				continue
+			}
+			for _, item := range items {
+				merged[item.ID] = pickBetterQwenSession(merged[item.ID], item)
+			}
+		}
+	}
+
+	if len(merged) == 0 {
 		return []SyncSession{}, nil
 	}
-
-	logs, err := findQwenLogs(tmpDir)
-	if err != nil {
-		return nil, err
+	sessions := make([]SyncSession, 0, len(merged))
+	for _, session := range merged {
+		sessions = append(sessions, session)
 	}
-
-	var sessions []SyncSession
-	for _, path := range logs {
-		items, err := parseQwenLog(path)
-		if err != nil {
-			continue
-		}
-		sessions = append(sessions, items...)
-	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
 	return sessions, nil
 }
 
@@ -1293,6 +1325,419 @@ func parseQwenLog(path string) ([]SyncSession, error) {
 		return sessions[i].StartedAt < sessions[j].StartedAt
 	})
 	return sessions, nil
+}
+
+func findQwenChats(projectsDir string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(path, ".jsonl") && strings.Contains(path, string(filepath.Separator)+"chats"+string(filepath.Separator)) {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func parseQwenChat(path string) ([]SyncSession, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	type qwenChatBucket struct {
+		session SyncSession
+	}
+
+	buckets := map[string]*qwenChatBucket{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			continue
+		}
+
+		sessionID := strings.TrimSpace(stringFrom(item["sessionId"]))
+		if sessionID == "" {
+			continue
+		}
+		bucket, ok := buckets[sessionID]
+		if !ok {
+			bucket = &qwenChatBucket{
+				session: SyncSession{ID: sessionID},
+			}
+			buckets[sessionID] = bucket
+		}
+
+		if bucket.session.Cwd == "" {
+			bucket.session.Cwd = normalizeCwd(stringFrom(item["cwd"]))
+		}
+		if bucket.session.Model == "" {
+			bucket.session.Model = strings.TrimSpace(stringFrom(item["model"]))
+		}
+
+		ts := strings.TrimSpace(stringFrom(item["timestamp"]))
+		if ts != "" {
+			if bucket.session.StartedAt == "" || ts < bucket.session.StartedAt {
+				bucket.session.StartedAt = ts
+			}
+			if bucket.session.EndedAt == "" || ts > bucket.session.EndedAt {
+				bucket.session.EndedAt = ts
+			}
+		}
+
+		eventType := strings.TrimSpace(stringFrom(item["type"]))
+		usage := mapFrom(item["usageMetadata"])
+		inputTokens := intFrom(usage["promptTokenCount"], 0)
+		outputTokens := intFrom(usage["candidatesTokenCount"], 0)
+		cachedInputTokens := intFrom(usage["cachedContentTokenCount"], 0)
+		reasoningTokens := intFrom(usage["thoughtsTokenCount"], 0)
+		totalTokens := intFrom(usage["totalTokenCount"], 0)
+		if totalTokens == 0 {
+			totalTokens = inputTokens + outputTokens + cachedInputTokens + reasoningTokens
+		}
+
+		role := ""
+		content := ""
+		switch eventType {
+		case "user", "assistant":
+			message := mapFrom(item["message"])
+			content = parseQwenMessageParts(message["parts"])
+			if content == "" {
+				content = strings.TrimSpace(stringFrom(item["message"]))
+			}
+			role = eventType
+		case "system", "about", "model_stats":
+			content = parseQwenSystemEvent(item)
+			role = "system"
+		}
+		if content != "" {
+			content = appendQwenMeta(content, item)
+			bucket.session.Messages = append(bucket.session.Messages, SyncMessage{
+				Index:             len(bucket.session.Messages),
+				Role:              role,
+				Content:           content,
+				Timestamp:         ts,
+				InputTokens:       inputTokens,
+				OutputTokens:      outputTokens,
+				CachedInputTokens: cachedInputTokens,
+				ReasoningTokens:   reasoningTokens,
+				TotalTokens:       totalTokens,
+			})
+			if bucket.session.Title == "" && role == "user" {
+				bucket.session.Title = content
+			}
+		}
+
+		bucket.session.TotalInputTokens += inputTokens
+		bucket.session.TotalOutputTokens += outputTokens
+		bucket.session.TotalCachedInputTokens += cachedInputTokens
+		bucket.session.TotalReasoningTokens += reasoningTokens
+		bucket.session.TotalTokens += totalTokens
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	sessions := make([]SyncSession, 0, len(buckets))
+	for _, bucket := range buckets {
+		session := bucket.session
+		if session.TotalTokens == 0 {
+			session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens + session.TotalReasoningTokens
+		}
+		if session.Title == "" {
+			if session.Cwd != "" {
+				session.Title = session.Cwd
+			} else {
+				session.Title = "Qwen session"
+			}
+		}
+		sessions = append(sessions, session)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+	return sessions, nil
+}
+
+func parseQwenMessageParts(value any) string {
+	items, _ := value.([]any)
+	if len(items) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		entry := mapFrom(item)
+		if text := strings.TrimSpace(stringFrom(entry["text"])); text != "" {
+			parts = append(parts, text)
+			continue
+		}
+		if raw := strings.TrimSpace(stringifyJSON(item)); raw != "" {
+			parts = append(parts, raw)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func parseQwenSystemEvent(item map[string]any) string {
+	eventType := strings.TrimSpace(stringFrom(item["type"]))
+	subtype := strings.TrimSpace(stringFrom(item["subtype"]))
+	systemPayload := mapFrom(item["systemPayload"])
+
+	if subtype == "slash_command" {
+		phase := strings.TrimSpace(stringFrom(systemPayload["phase"]))
+		rawCommand := strings.TrimSpace(stringFrom(systemPayload["rawCommand"]))
+		if phase == "" && rawCommand == "" {
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprintf("[slash_command] phase=%s command=%s", phase, rawCommand))
+	}
+
+	if subtype == "ui_telemetry" {
+		uiEvent := mapFrom(systemPayload["uiEvent"])
+		eventName := strings.TrimSpace(stringFrom(uiEvent["event.name"]))
+		model := strings.TrimSpace(stringFrom(uiEvent["model"]))
+		status := intFrom(uiEvent["status_code"], 0)
+		durationMs := intFrom(uiEvent["duration_ms"], 0)
+		responseID := strings.TrimSpace(stringFrom(uiEvent["response_id"]))
+		parts := make([]string, 0, 5)
+		if eventName != "" {
+			parts = append(parts, "event="+eventName)
+		}
+		if model != "" {
+			parts = append(parts, "model="+model)
+		}
+		if status > 0 {
+			parts = append(parts, "status="+strconv.Itoa(status))
+		}
+		if durationMs > 0 {
+			parts = append(parts, "duration_ms="+strconv.Itoa(durationMs))
+		}
+		if responseID != "" {
+			parts = append(parts, "response_id="+responseID)
+		}
+		if len(parts) == 0 {
+			return ""
+		}
+		return "[ui_telemetry] " + strings.Join(parts, " ")
+	}
+
+	outputItems, _ := systemPayload["outputHistoryItems"].([]any)
+	if len(outputItems) > 0 {
+		itemTypes := make([]string, 0, len(outputItems))
+		for _, raw := range outputItems {
+			entry := mapFrom(raw)
+			itemType := strings.TrimSpace(stringFrom(entry["type"]))
+			if itemType != "" {
+				itemTypes = append(itemTypes, itemType)
+			}
+		}
+		if len(itemTypes) > 0 {
+			return fmt.Sprintf("[%s] output_items=%s", eventType, strings.Join(itemTypes, ","))
+		}
+	}
+
+	if subtype != "" {
+		return fmt.Sprintf("[%s] subtype=%s", eventType, subtype)
+	}
+	if eventType != "" {
+		return fmt.Sprintf("[%s]", eventType)
+	}
+	return ""
+}
+
+func appendQwenMeta(content string, item map[string]any) string {
+	meta := map[string]string{}
+
+	add := func(key string, value any) {
+		text := strings.TrimSpace(stringFrom(value))
+		if text == "" {
+			return
+		}
+		meta[key] = text
+	}
+	addNum := func(key string, value any) {
+		num := int64From(value, 0)
+		if num <= 0 {
+			return
+		}
+		meta[key] = strconv.FormatInt(num, 10)
+	}
+
+	add("event_type", item["type"])
+	add("subtype", item["subtype"])
+	add("uuid", item["uuid"])
+	add("parent_uuid", item["parentUuid"])
+	add("session_id", item["sessionId"])
+	add("timestamp", item["timestamp"])
+	add("cwd", item["cwd"])
+	add("version", item["version"])
+	add("git_branch", item["gitBranch"])
+	add("model", item["model"])
+
+	usage := mapFrom(item["usageMetadata"])
+	addNum("usage.prompt_token_count", usage["promptTokenCount"])
+	addNum("usage.candidates_token_count", usage["candidatesTokenCount"])
+	addNum("usage.cached_content_token_count", usage["cachedContentTokenCount"])
+	addNum("usage.thoughts_token_count", usage["thoughtsTokenCount"])
+	addNum("usage.total_token_count", usage["totalTokenCount"])
+
+	systemPayload := mapFrom(item["systemPayload"])
+	if strings.EqualFold(strings.TrimSpace(stringFrom(item["subtype"])), "slash_command") {
+		add("slash.phase", systemPayload["phase"])
+		add("slash.raw_command", systemPayload["rawCommand"])
+		outputItems, _ := systemPayload["outputHistoryItems"].([]any)
+		if len(outputItems) > 0 {
+			types := make([]string, 0, len(outputItems))
+			for _, raw := range outputItems {
+				entry := mapFrom(raw)
+				itemType := strings.TrimSpace(stringFrom(entry["type"]))
+				if itemType != "" {
+					types = append(types, itemType)
+				}
+			}
+			if len(types) > 0 {
+				meta["slash.output_item_types"] = strings.Join(types, ",")
+			}
+		}
+	}
+
+	uiEvent := mapFrom(systemPayload["uiEvent"])
+	add("telemetry.event_name", uiEvent["event.name"])
+	add("telemetry.event_timestamp", uiEvent["event.timestamp"])
+	add("telemetry.response_id", uiEvent["response_id"])
+	add("telemetry.model", uiEvent["model"])
+	addNum("telemetry.status_code", uiEvent["status_code"])
+	addNum("telemetry.duration_ms", uiEvent["duration_ms"])
+	addNum("telemetry.input_token_count", uiEvent["input_token_count"])
+	addNum("telemetry.output_token_count", uiEvent["output_token_count"])
+	addNum("telemetry.cached_content_token_count", uiEvent["cached_content_token_count"])
+	addNum("telemetry.thoughts_token_count", uiEvent["thoughts_token_count"])
+	addNum("telemetry.tool_token_count", uiEvent["tool_token_count"])
+	addNum("telemetry.total_token_count", uiEvent["total_token_count"])
+	add("telemetry.prompt_id", uiEvent["prompt_id"])
+	add("telemetry.auth_type", uiEvent["auth_type"])
+
+	if len(meta) == 0 {
+		return content
+	}
+
+	keys := make([]string, 0, len(meta))
+	for key := range meta {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	lines := make([]string, 0, len(keys)+1)
+	lines = append(lines, "[meta]")
+	for _, key := range keys {
+		lines = append(lines, key+": "+meta[key])
+	}
+	metaText := strings.Join(lines, "\n")
+	if strings.TrimSpace(content) == "" {
+		return metaText
+	}
+	return strings.TrimSpace(content) + "\n\n" + metaText
+}
+
+func pickBetterQwenSession(current SyncSession, incoming SyncSession) SyncSession {
+	if incoming.ID == "" {
+		return current
+	}
+	if current.ID == "" {
+		return incoming
+	}
+
+	currentHasAssistant := qwenHasAssistant(current)
+	incomingHasAssistant := qwenHasAssistant(incoming)
+	if incomingHasAssistant && !currentHasAssistant {
+		return qwenMergeSessionMeta(incoming, current)
+	}
+	if currentHasAssistant && !incomingHasAssistant {
+		return qwenMergeSessionMeta(current, incoming)
+	}
+
+	currentHasTokens := qwenHasTokens(current)
+	incomingHasTokens := qwenHasTokens(incoming)
+	if incomingHasTokens && !currentHasTokens {
+		return qwenMergeSessionMeta(incoming, current)
+	}
+	if currentHasTokens && !incomingHasTokens {
+		return qwenMergeSessionMeta(current, incoming)
+	}
+
+	merged := current
+	if qwenSessionScore(incoming) > qwenSessionScore(current) {
+		return qwenMergeSessionMeta(incoming, current)
+	}
+
+	return qwenMergeSessionMeta(merged, incoming)
+}
+
+func qwenSessionScore(session SyncSession) int {
+	score := len(session.Messages)
+	if qwenHasAssistant(session) {
+		score += 1000
+	}
+	if qwenHasTokens(session) {
+		score += 500
+	}
+	return score
+}
+
+func qwenHasAssistant(session SyncSession) bool {
+	for _, msg := range session.Messages {
+		if msg.Role == "assistant" {
+			return true
+		}
+	}
+	return false
+}
+
+func qwenHasTokens(session SyncSession) bool {
+	return session.TotalTokens > 0 ||
+		session.TotalInputTokens > 0 ||
+		session.TotalOutputTokens > 0 ||
+		session.TotalCachedInputTokens > 0 ||
+		session.TotalReasoningTokens > 0
+}
+
+func qwenMergeSessionMeta(primary SyncSession, secondary SyncSession) SyncSession {
+	merged := primary
+	if merged.Title == "" {
+		merged.Title = secondary.Title
+	}
+	if merged.Cwd == "" {
+		merged.Cwd = secondary.Cwd
+	}
+	if merged.Model == "" {
+		merged.Model = secondary.Model
+	}
+	if merged.StartedAt == "" || (secondary.StartedAt != "" && secondary.StartedAt < merged.StartedAt) {
+		merged.StartedAt = secondary.StartedAt
+	}
+	if merged.EndedAt == "" || (secondary.EndedAt != "" && secondary.EndedAt > merged.EndedAt) {
+		merged.EndedAt = secondary.EndedAt
+	}
+	return merged
 }
 
 func loadClineSessions(root string) ([]SyncSession, error) {
@@ -2151,12 +2596,244 @@ func quoteStrings(values []string) string {
 }
 
 func loadAmpSessions(root string) ([]SyncSession, error) {
-	return []SyncSession{}, nil
+	threadsDir := filepath.Join(root, "threads")
+	info, err := os.Stat(threadsDir)
+	if (err != nil || !info.IsDir()) && strings.TrimSpace(root) != "" {
+		legacyRoot := expandUser("~/.amp")
+		if root == legacyRoot {
+			fallback := expandUser("~/.local/share/amp")
+			fallbackDir := filepath.Join(fallback, "threads")
+			if stat, statErr := os.Stat(fallbackDir); statErr == nil && stat.IsDir() {
+				threadsDir = fallbackDir
+			}
+		}
+	}
+
+	entries, err := os.ReadDir(threadsDir)
+	if err != nil {
+		return []SyncSession{}, nil
+	}
+
+	sessions := make([]SyncSession, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(threadsDir, entry.Name())
+		session, ok := parseAmpThread(path)
+		if ok {
+			sessions = append(sessions, session)
+		}
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+	return sessions, nil
+}
+
+func parseAmpThread(path string) (SyncSession, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+
+	var thread map[string]any
+	if err := json.Unmarshal(raw, &thread); err != nil {
+		return SyncSession{}, false
+	}
+
+	sessionID := strings.TrimSpace(stringFrom(thread["id"]))
+	if sessionID == "" {
+		sessionID = strings.TrimSuffix(filepath.Base(path), ".json")
+	}
+	if sessionID == "" {
+		return SyncSession{}, false
+	}
+
+	startedMs := int64From(thread["created"], 0)
+	endedMs := startedMs
+	cwd := extractAmpCwd(thread)
+
+	session := SyncSession{
+		ID:    sessionID,
+		Title: strings.TrimSpace(stringFrom(thread["title"])),
+		Cwd:   cwd,
+	}
+
+	entries, _ := thread["messages"].([]any)
+	msgIndex := 0
+	for _, item := range entries {
+		msg := mapFrom(item)
+		role := strings.TrimSpace(stringFrom(msg["role"]))
+		if role == "" {
+			continue
+		}
+
+		tsMs := int64From(mapFrom(msg["meta"])["sentAt"], 0)
+		if tsMs > 0 {
+			if startedMs == 0 || tsMs < startedMs {
+				startedMs = tsMs
+			}
+			if tsMs > endedMs {
+				endedMs = tsMs
+			}
+		}
+
+		content := parseAmpContent(msg["content"])
+		if content != "" {
+			session.Messages = append(session.Messages, SyncMessage{
+				Index:     msgIndex,
+				Role:      role,
+				Content:   content,
+				Timestamp: formatMillis(tsMs),
+			})
+			if session.Title == "" && role == "user" {
+				session.Title = content
+			}
+			msgIndex++
+		}
+
+		if role == "assistant" {
+			usage := mapFrom(msg["usage"])
+			model := strings.TrimSpace(stringFrom(usage["model"]))
+			if model != "" {
+				session.Model = model
+			}
+			inputTokens := intFrom(usage["inputTokens"], 0)
+			outputTokens := intFrom(usage["outputTokens"], 0)
+			cacheCreate := intFrom(usage["cacheCreationInputTokens"], 0)
+			cacheRead := intFrom(usage["cacheReadInputTokens"], 0)
+			session.TotalInputTokens += inputTokens
+			session.TotalOutputTokens += outputTokens
+			session.TotalCachedInputTokens += cacheCreate + cacheRead
+		}
+	}
+
+	if session.TotalInputTokens == 0 && session.TotalOutputTokens == 0 {
+		accumulateAmpUsageLedger(&session, thread)
+	}
+
+	if endedMs == 0 {
+		if stat, statErr := os.Stat(path); statErr == nil {
+			endedMs = stat.ModTime().UnixMilli()
+		}
+	}
+	if startedMs == 0 {
+		startedMs = endedMs
+	}
+	session.StartedAt = formatMillis(startedMs)
+	session.EndedAt = formatMillis(endedMs)
+	session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens
+
+	session.Cwd = normalizeCwd(session.Cwd)
+	if session.Title == "" {
+		if session.Cwd != "" {
+			session.Title = session.Cwd
+		} else {
+			session.Title = "AMP session"
+		}
+	}
+	if len(session.Messages) == 0 {
+		return SyncSession{}, false
+	}
+	return session, true
+}
+
+func extractAmpCwd(thread map[string]any) string {
+	env := mapFrom(thread["env"])
+	initial := mapFrom(env["initial"])
+	trees, _ := initial["trees"].([]any)
+	for _, item := range trees {
+		tree := mapFrom(item)
+		uri := strings.TrimSpace(stringFrom(tree["uri"]))
+		if uri == "" {
+			continue
+		}
+		if strings.HasPrefix(uri, "file://") {
+			return normalizeCwd(strings.TrimPrefix(uri, "file://"))
+		}
+		return normalizeCwd(uri)
+	}
+	return ""
+}
+
+func parseAmpContent(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			entry := mapFrom(item)
+			entryType := stringFrom(entry["type"])
+			switch entryType {
+			case "text":
+				if text := strings.TrimSpace(stringFrom(entry["text"])); text != "" {
+					parts = append(parts, text)
+				}
+			case "thinking":
+				if text := strings.TrimSpace(stringFrom(entry["thinking"])); text != "" {
+					parts = append(parts, "[thinking]\n"+text)
+				}
+			case "tool_use":
+				name := strings.TrimSpace(stringFrom(entry["name"]))
+				inputText := stringifyJSON(entry["input"])
+				if inputText == "" {
+					if name != "" {
+						parts = append(parts, fmt.Sprintf("[tool_use] %s", name))
+					} else {
+						parts = append(parts, "[tool_use]")
+					}
+				} else if name != "" {
+					parts = append(parts, fmt.Sprintf("[tool_use] %s\n%s", name, inputText))
+				} else {
+					parts = append(parts, fmt.Sprintf("[tool_use]\n%s", inputText))
+				}
+			case "tool_result":
+				contentText := stringifyJSON(entry["content"])
+				if contentText == "" {
+					contentText = stringFrom(entry["content"])
+				}
+				if contentText == "" {
+					parts = append(parts, "[tool_result]")
+				} else {
+					parts = append(parts, fmt.Sprintf("[tool_result]\n%s", contentText))
+				}
+			default:
+				if text := strings.TrimSpace(stringFrom(entry["text"])); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	default:
+		return ""
+	}
+}
+
+func accumulateAmpUsageLedger(session *SyncSession, thread map[string]any) {
+	ledger := mapFrom(thread["usageLedger"])
+	events, _ := ledger["events"].([]any)
+	for _, item := range events {
+		event := mapFrom(item)
+		if strings.TrimSpace(stringFrom(event["operationType"])) != "inference" {
+			continue
+		}
+		model := strings.TrimSpace(stringFrom(event["model"]))
+		if model != "" && session.Model == "" {
+			session.Model = model
+		}
+		tokens := mapFrom(event["tokens"])
+		session.TotalInputTokens += intFrom(tokens["input"], 0)
+		session.TotalOutputTokens += intFrom(tokens["output"], 0)
+	}
 }
 
 func loadOpenCodeSessions(root string) ([]SyncSession, error) {
 	dataRoot := filepath.Join(root, "storage")
 	sessionsDir := filepath.Join(dataRoot, "session")
+	messagesDir := filepath.Join(dataRoot, "message")
 	partsDir := filepath.Join(dataRoot, "part")
 	projectsDir := filepath.Join(dataRoot, "project")
 
@@ -2190,7 +2867,7 @@ func loadOpenCodeSessions(root string) ([]SyncSession, error) {
 			}
 
 			sessionPath := filepath.Join(projectDir, sessionFile.Name())
-			session, ok := parseOpenCodeSession(sessionPath, projects, partsDir)
+			session, ok := parseOpenCodeSession(sessionPath, projects, messagesDir, partsDir)
 			if ok {
 				sessions = append(sessions, session)
 			}
@@ -2203,6 +2880,201 @@ func loadOpenCodeSessions(root string) ([]SyncSession, error) {
 	})
 
 	return sessions, nil
+}
+
+func loadPiSessions(root string) ([]SyncSession, error) {
+	sessionsDir := filepath.Join(root, "agent", "sessions")
+	info, err := os.Stat(sessionsDir)
+	if err != nil || !info.IsDir() {
+		fallback := filepath.Join(root, "sessions")
+		if stat, statErr := os.Stat(fallback); statErr == nil && stat.IsDir() {
+			sessionsDir = fallback
+		}
+	}
+
+	entries, err := listJSONL(sessionsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	sessions := make([]SyncSession, 0, len(entries))
+	for _, path := range entries {
+		session, ok := parsePiSession(path)
+		if ok {
+			sessions = append(sessions, session)
+		}
+	}
+	return sessions, nil
+}
+
+func parsePiSession(path string) (SyncSession, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	defer file.Close()
+
+	session := SyncSession{}
+	if stat, statErr := file.Stat(); statErr == nil {
+		session.EndedAt = stat.ModTime().UTC().Format(time.RFC3339)
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	msgIndex := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			continue
+		}
+
+		switch stringFrom(item["type"]) {
+		case "session":
+			session.ID = strings.TrimSpace(stringFrom(item["id"]))
+			if ts := parsePiTimestamp(item["timestamp"]); ts != "" {
+				session.StartedAt = ts
+			}
+			if session.Cwd == "" {
+				session.Cwd = normalizeCwd(stringFrom(item["cwd"]))
+			}
+		case "model_change":
+			model := strings.TrimSpace(stringFrom(item["modelId"]))
+			if model != "" {
+				session.Model = model
+			}
+		case "message":
+			msg := mapFrom(item["message"])
+			role := strings.TrimSpace(stringFrom(msg["role"]))
+			if role == "" {
+				continue
+			}
+
+			content := parsePiMessageContent(msg)
+			timestamp := parsePiTimestamp(msg["timestamp"])
+			if timestamp == "" {
+				timestamp = parsePiTimestamp(item["timestamp"])
+			}
+			if content != "" {
+				session.Messages = append(session.Messages, SyncMessage{
+					Index:     msgIndex,
+					Role:      role,
+					Content:   content,
+					Timestamp: timestamp,
+				})
+				if session.Title == "" && role == "user" {
+					session.Title = content
+				}
+				msgIndex++
+			}
+
+			usage := mapFrom(msg["usage"])
+			session.TotalInputTokens += intFrom(usage["input"], 0)
+			session.TotalOutputTokens += intFrom(usage["output"], 0)
+			session.TotalCachedInputTokens += intFrom(usage["cacheRead"], 0)
+			if session.Model == "" {
+				if model := strings.TrimSpace(stringFrom(msg["model"])); model != "" {
+					session.Model = model
+				}
+			}
+			if ts := parsePiTimestamp(item["timestamp"]); ts != "" {
+				if session.EndedAt == "" || ts > session.EndedAt {
+					session.EndedAt = ts
+				}
+			}
+		}
+	}
+
+	if session.ID == "" {
+		return SyncSession{}, false
+	}
+	if session.Cwd == "" {
+		session.Cwd = normalizeCwd(session.Cwd)
+	}
+	if session.StartedAt == "" {
+		session.StartedAt = session.EndedAt
+	}
+	if session.EndedAt == "" {
+		session.EndedAt = session.StartedAt
+	}
+	session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens + session.TotalReasoningTokens
+	if session.Title == "" {
+		if session.Cwd != "" {
+			session.Title = session.Cwd
+		} else {
+			session.Title = "PI session"
+		}
+	}
+	return session, true
+}
+
+func parsePiMessageContent(message map[string]any) string {
+	parts := make([]string, 0)
+	contentItems, _ := message["content"].([]any)
+	for _, item := range contentItems {
+		entry := mapFrom(item)
+		switch strings.TrimSpace(stringFrom(entry["type"])) {
+		case "text":
+			if text := strings.TrimSpace(stringFrom(entry["text"])); text != "" {
+				parts = append(parts, text)
+			}
+		case "toolCall":
+			name := strings.TrimSpace(stringFrom(entry["name"]))
+			inputText := stringifyJSON(entry["arguments"])
+			if name == "" {
+				name = "tool"
+			}
+			if inputText == "" {
+				parts = append(parts, fmt.Sprintf("[tool_use] %s", name))
+			} else {
+				parts = append(parts, fmt.Sprintf("[tool_use] %s\n%s", name, inputText))
+			}
+		default:
+			if text := strings.TrimSpace(stringFrom(entry["text"])); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+
+	if len(parts) == 0 {
+		if text := strings.TrimSpace(stringFrom(message["errorMessage"])); text != "" {
+			parts = append(parts, "[error]\n"+text)
+		}
+	}
+
+	result := strings.TrimSpace(strings.Join(parts, "\n"))
+	if role := strings.TrimSpace(stringFrom(message["role"])); role == "toolResult" && result != "" {
+		toolName := strings.TrimSpace(stringFrom(message["toolName"]))
+		if toolName == "" {
+			toolName = "tool"
+		}
+		return fmt.Sprintf("[tool_result] %s\n%s", toolName, result)
+	}
+	return result
+}
+
+func parsePiTimestamp(value any) string {
+	switch v := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return ""
+		}
+		if _, err := time.Parse(time.RFC3339, trimmed); err == nil {
+			return trimmed
+		}
+		if ms := int64From(trimmed, 0); ms > 0 {
+			return formatMillis(ms)
+		}
+		return ""
+	default:
+		return formatMillis(int64From(v, 0))
+	}
 }
 
 func loadOpenCodeProjects(projectsDir string, projects map[string]opencodeProject) error {
@@ -2235,7 +3107,7 @@ func loadOpenCodeProjects(projectsDir string, projects map[string]opencodeProjec
 	return nil
 }
 
-func parseOpenCodeSession(sessionPath string, projects map[string]opencodeProject, partsDir string) (SyncSession, bool) {
+func parseOpenCodeSession(sessionPath string, projects map[string]opencodeProject, messagesDir string, partsDir string) (SyncSession, bool) {
 	raw, err := os.ReadFile(sessionPath)
 	if err != nil {
 		return SyncSession{}, false
@@ -2272,10 +3144,24 @@ func parseOpenCodeSession(sessionPath string, projects map[string]opencodeProjec
 		session.Cwd = normalizeCwd(project.Worktree)
 	}
 
-	// Load messages for this session
-	messages, err := loadOpenCodeMessages(sess.ID, partsDir)
+	// Load messages and usage for this session.
+	content, err := loadOpenCodeSessionContent(sess.ID, messagesDir, partsDir)
 	if err == nil {
-		session.Messages = messages
+		session.Messages = content.Messages
+		session.TotalInputTokens = content.TotalInputTokens
+		session.TotalOutputTokens = content.TotalOutputTokens
+		session.TotalCachedInputTokens = content.TotalCachedInputTokens
+		session.TotalReasoningTokens = content.TotalReasoningTokens
+		session.TotalTokens = content.TotalInputTokens + content.TotalOutputTokens + content.TotalCachedInputTokens + content.TotalReasoningTokens
+		if session.Model == "" {
+			session.Model = content.Model
+		}
+		if session.Cwd == "" {
+			session.Cwd = content.Cwd
+		}
+		if session.EndedAt == "" {
+			session.EndedAt = content.LastTimestamp
+		}
 	}
 
 	// Set title if empty
@@ -2289,119 +3175,248 @@ func parseOpenCodeSession(sessionPath string, projects map[string]opencodeProjec
 	return session, true
 }
 
-func loadOpenCodeMessages(sessionID string, partsDir string) ([]SyncMessage, error) {
-	// Find all message directories for this session
-	entries, err := os.ReadDir(partsDir)
+type opencodeSessionContent struct {
+	Messages               []SyncMessage
+	TotalInputTokens       int
+	TotalOutputTokens      int
+	TotalCachedInputTokens int
+	TotalReasoningTokens   int
+	Model                  string
+	Cwd                    string
+	LastTimestamp          string
+}
+
+type opencodeStoredMessage struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+	Role      string `json:"role"`
+	ModelID   string `json:"modelID"`
+	Path      struct {
+		Cwd string `json:"cwd"`
+	} `json:"path"`
+	Model struct {
+		ModelID string `json:"modelID"`
+	} `json:"model"`
+	Summary struct {
+		Title string `json:"title"`
+	} `json:"summary"`
+	Time struct {
+		Created   int64 `json:"created"`
+		Completed int64 `json:"completed"`
+	} `json:"time"`
+	Tokens struct {
+		Input     int `json:"input"`
+		Output    int `json:"output"`
+		Reasoning int `json:"reasoning"`
+		Cache     struct {
+			Read int `json:"read"`
+		} `json:"cache"`
+	} `json:"tokens"`
+}
+
+func loadOpenCodeSessionContent(sessionID string, messagesDir string, partsDir string) (opencodeSessionContent, error) {
+	sessionDir := filepath.Join(messagesDir, sessionID)
+	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
-		return nil, err
+		return opencodeSessionContent{}, err
 	}
 
-	var messageDirs []string
+	type messageEntry struct {
+		path string
+		msg  opencodeStoredMessage
+	}
+	messageEntries := make([]messageEntry, 0, len(entries))
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "msg_") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-
-		msgDir := filepath.Join(partsDir, entry.Name())
-		partFiles, err := os.ReadDir(msgDir)
+		path := filepath.Join(sessionDir, entry.Name())
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
-
-		// Check if any part belongs to this session
-		for _, partFile := range partFiles {
-			if partFile.IsDir() || !strings.HasSuffix(partFile.Name(), ".json") {
-				continue
-			}
-
-			partPath := filepath.Join(msgDir, partFile.Name())
-			raw, err := os.ReadFile(partPath)
-			if err != nil {
-				continue
-			}
-
-			var part opencodeMessage
-			if err := json.Unmarshal(raw, &part); err != nil {
-				continue
-			}
-
-			if part.SessionID == sessionID {
-				messageDirs = append(messageDirs, msgDir)
-				break
-			}
+		var msg opencodeStoredMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
 		}
+		if msg.ID == "" {
+			continue
+		}
+		messageEntries = append(messageEntries, messageEntry{path: path, msg: msg})
 	}
 
-	// Load all parts for each message and build messages
-	var messages []SyncMessage
-	messageIndex := 0
+	sort.Slice(messageEntries, func(i, j int) bool {
+		li := messageEntries[i].msg.Time.Created
+		lj := messageEntries[j].msg.Time.Created
+		if li == lj {
+			return messageEntries[i].msg.ID < messageEntries[j].msg.ID
+		}
+		return li < lj
+	})
 
-	for _, msgDir := range messageDirs {
-		partFiles, err := os.ReadDir(msgDir)
-		if err != nil {
-			continue
+	result := opencodeSessionContent{}
+	for _, item := range messageEntries {
+		msg := item.msg
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			role = "assistant"
+		}
+		timestampMs := msg.Time.Created
+		if timestampMs == 0 {
+			timestampMs = msg.Time.Completed
+		}
+		if msg.Time.Completed > timestampMs {
+			timestampMs = msg.Time.Completed
 		}
 
-		var msgParts []opencodeMessage
-		var msgTime opencodeTime
-		var msgRole string
-		var msgContent string
-
-		for _, partFile := range partFiles {
-			if partFile.IsDir() || !strings.HasSuffix(partFile.Name(), ".json") {
-				continue
-			}
-
-			partPath := filepath.Join(msgDir, partFile.Name())
-			raw, err := os.ReadFile(partPath)
-			if err != nil {
-				continue
-			}
-
-			var part opencodeMessage
-			if err := json.Unmarshal(raw, &part); err != nil {
-				continue
-			}
-
-			msgParts = append(msgParts, part)
-
-			// Extract role and content from parts
-			if part.Type == "text" && part.Text != "" {
-				msgContent = part.Text
-				if msgRole == "" {
-					msgRole = "user"
-				}
-			} else if part.Type == "tool" {
-				msgRole = "assistant"
-			}
-
-			// Update time
-			if part.Time.Start != 0 && (msgTime.Start == 0 || part.Time.Start < msgTime.Start) {
-				msgTime.Start = part.Time.Start
-			}
-			if part.Time.End != 0 && (msgTime.End == 0 || part.Time.End > msgTime.End) {
-				msgTime.End = part.Time.End
-			}
+		parts, partTimestampMs := loadOpenCodeMessageParts(msg.ID, partsDir)
+		if partTimestampMs > timestampMs {
+			timestampMs = partTimestampMs
 		}
-
-		// Create message if we have content
-		if msgContent != "" {
-			timestamp := ""
-			if msgTime.Start != 0 {
-				timestamp = formatMillis(msgTime.Start)
-			}
-
-			messages = append(messages, SyncMessage{
-				Index:     messageIndex,
-				Role:      msgRole,
-				Content:   msgContent,
-				Timestamp: timestamp,
+		content := strings.TrimSpace(strings.Join(parts, "\n"))
+		if content == "" && role == "user" {
+			content = strings.TrimSpace(msg.Summary.Title)
+		}
+		if content != "" {
+			result.Messages = append(result.Messages, SyncMessage{
+				Index:     len(result.Messages),
+				Role:      role,
+				Content:   content,
+				Timestamp: formatMillis(timestampMs),
 			})
-			messageIndex++
+		}
+
+		if role == "assistant" {
+			result.TotalInputTokens += msg.Tokens.Input
+			result.TotalOutputTokens += msg.Tokens.Output
+			result.TotalCachedInputTokens += msg.Tokens.Cache.Read
+			result.TotalReasoningTokens += msg.Tokens.Reasoning
+		}
+		if result.Model == "" {
+			if model := strings.TrimSpace(msg.ModelID); model != "" {
+				result.Model = model
+			} else if model := strings.TrimSpace(msg.Model.ModelID); model != "" {
+				result.Model = model
+			}
+		}
+		if result.Cwd == "" {
+			result.Cwd = normalizeCwd(msg.Path.Cwd)
+		}
+		if ts := formatMillis(timestampMs); ts != "" {
+			if result.LastTimestamp == "" || ts > result.LastTimestamp {
+				result.LastTimestamp = ts
+			}
 		}
 	}
 
-	return messages, nil
+	return result, nil
+}
+
+type opencodePartContent struct {
+	OrderMs int64
+	ID      string
+	Text    string
+}
+
+func loadOpenCodeMessageParts(messageID string, partsDir string) ([]string, int64) {
+	msgPartDir := filepath.Join(partsDir, messageID)
+	entries, err := os.ReadDir(msgPartDir)
+	if err != nil {
+		return nil, 0
+	}
+
+	parts := make([]opencodePartContent, 0, len(entries))
+	var maxTimestamp int64
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(msgPartDir, entry.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		payload := map[string]any{}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			continue
+		}
+
+		timeObj := mapFrom(payload["time"])
+		start := int64From(timeObj["start"], 0)
+		end := int64From(timeObj["end"], 0)
+		order := start
+		if order == 0 {
+			order = end
+		}
+		if start > maxTimestamp {
+			maxTimestamp = start
+		}
+		if end > maxTimestamp {
+			maxTimestamp = end
+		}
+
+		content := parseOpenCodePartContent(payload)
+		if content == "" {
+			continue
+		}
+		parts = append(parts, opencodePartContent{
+			OrderMs: order,
+			ID:      stringFrom(payload["id"]),
+			Text:    content,
+		})
+	}
+
+	sort.Slice(parts, func(i, j int) bool {
+		if parts[i].OrderMs == parts[j].OrderMs {
+			return parts[i].ID < parts[j].ID
+		}
+		return parts[i].OrderMs < parts[j].OrderMs
+	})
+
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		result = append(result, part.Text)
+	}
+	return result, maxTimestamp
+}
+
+func parseOpenCodePartContent(payload map[string]any) string {
+	partType := strings.TrimSpace(stringFrom(payload["type"]))
+	switch partType {
+	case "text":
+		return strings.TrimSpace(stringFrom(payload["text"]))
+	case "reasoning":
+		text := strings.TrimSpace(stringFrom(payload["text"]))
+		if text == "" {
+			return ""
+		}
+		return "[reasoning]\n" + text
+	case "tool":
+		tool := strings.TrimSpace(stringFrom(payload["tool"]))
+		state := mapFrom(payload["state"])
+		inputText := stringifyJSON(state["input"])
+		if tool == "" {
+			tool = "tool"
+		}
+		if inputText == "" {
+			return fmt.Sprintf("[tool] %s", tool)
+		}
+		return fmt.Sprintf("[tool] %s\n%s", tool, inputText)
+	case "patch":
+		files, _ := payload["files"].([]any)
+		fileNames := make([]string, 0, len(files))
+		for _, f := range files {
+			if name := strings.TrimSpace(stringFrom(f)); name != "" {
+				fileNames = append(fileNames, name)
+			}
+		}
+		if len(fileNames) == 0 {
+			return "[patch]"
+		}
+		return fmt.Sprintf("[patch]\n%s", strings.Join(fileNames, "\n"))
+	default:
+		return ""
+	}
 }
 
 func loadAntigravitySessions(root string) ([]SyncSession, error) {
@@ -3070,6 +4085,7 @@ func parseSources(value string) ([]string, error) {
 			"cursor",
 			"amp",
 			"opencode",
+			"pi",
 			"antigravity",
 			"droid",
 		}, nil
@@ -3086,6 +4102,7 @@ func parseSources(value string) ([]string, error) {
 		"cursor":      true,
 		"amp":         true,
 		"opencode":    true,
+		"pi":          true,
 		"antigravity": true,
 		"droid":       true,
 	}
@@ -3108,6 +4125,7 @@ func parseSources(value string) ([]string, error) {
 				"cursor",
 				"amp",
 				"opencode",
+				"pi",
 				"antigravity",
 				"droid",
 			}, nil
@@ -3148,6 +4166,8 @@ func defaultToolName(source string) string {
 		return "amp"
 	case "opencode":
 		return "opencode"
+	case "pi":
+		return "pi"
 	case "antigravity":
 		return "antigravity"
 	case "droid":
