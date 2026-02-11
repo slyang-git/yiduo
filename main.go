@@ -76,6 +76,11 @@ type syncState struct {
 	LastSync map[string]string `json:"last_sync"`
 }
 
+type daemonMeta struct {
+	PID       int    `json:"pid"`
+	StartedAt string `json:"started_at"`
+}
+
 type syncOptions struct {
 	incremental bool
 	state       *syncState
@@ -116,12 +121,20 @@ func main() {
 
 	extraArgs := flag.Args()
 	forceDaemonStart := false
+	isDaemonWorker := os.Getenv(daemonEnv) != ""
 	if len(extraArgs) > 0 {
 		switch extraArgs[0] {
 		case "status":
 			printDaemonStatus()
 			return
 		case "stop":
+			if running, pid := daemonRunning(); running {
+				fmt.Printf("yiduo sync daemon stopping (pid %d)\n", pid)
+				if startedAt, ok := daemonStartedAt(pid); ok {
+					fmt.Printf("Started at: %s\n", formatStatusTime(startedAt))
+					fmt.Printf("Uptime: %s\n", formatDuration(time.Since(startedAt)))
+				}
+			}
 			if err := stopDaemon(); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to stop daemon: %v\n", err)
 				os.Exit(1)
@@ -130,6 +143,34 @@ func main() {
 			return
 		case "start":
 			forceDaemonStart = true
+		case "restart":
+			if isDaemonWorker {
+				forceDaemonStart = true
+				break
+			}
+			if running, pid := daemonRunning(); running {
+				fmt.Printf("yiduo sync daemon restarting (pid %d)\n", pid)
+				if startedAt, ok := daemonStartedAt(pid); ok {
+					fmt.Printf("Started at: %s\n", formatStatusTime(startedAt))
+					fmt.Printf("Uptime: %s\n", formatDuration(time.Since(startedAt)))
+				}
+				if err := stopDaemon(); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to stop daemon: %v\n", err)
+					os.Exit(1)
+				}
+				if err := waitForDaemonStop(5 * time.Second); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to restart daemon: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				fmt.Println("yiduo sync daemon not running, starting a new daemon")
+			}
+			if err := spawnDaemon(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to start daemon: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("yiduo sync daemon restarted")
+			return
 		default:
 			fmt.Fprintf(os.Stderr, "unknown command: %s\n", extraArgs[0])
 			os.Exit(2)
@@ -137,7 +178,7 @@ func main() {
 	}
 
 	daemonEnabled := *daemon || *daemonShort || forceDaemonStart
-	daemonWorker := daemonEnabled && os.Getenv(daemonEnv) != ""
+	daemonWorker := daemonEnabled && isDaemonWorker
 	if daemonEnabled && !daemonWorker {
 		if running, pid := daemonRunning(); running {
 			fmt.Printf("yiduo sync daemon already running (pid %d)\n", pid)
@@ -157,7 +198,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to ensure device id: %v\n", err)
 		os.Exit(1)
 	}
-	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "http://localhost:8000")
+	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "https://yiduo.one/")
 	resolvedDeviceToken := firstNonEmpty(*deviceToken, os.Getenv("AI_WRAPPED_SYNC_TOKEN"), os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.DeviceToken)
 	deviceInfo := DeviceInfo{
 		ID:   config.DeviceID,
@@ -361,7 +402,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 func runSyncLoop(runOnce func() (int, error), state *syncState, logFile *os.File) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	defer removeDaemonPid()
+	defer removeDaemonState()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -499,9 +540,18 @@ func spawnDaemon() error {
 func printDaemonStatus() {
 	if running, pid := daemonRunning(); running {
 		fmt.Printf("yiduo sync daemon running (pid %d)\n", pid)
+		if startedAt, ok := daemonStartedAt(pid); ok {
+			fmt.Printf("Started at: %s\n", formatStatusTime(startedAt))
+			fmt.Printf("Uptime: %s\n", formatDuration(time.Since(startedAt)))
+		}
 		return
 	}
 	fmt.Println("yiduo sync daemon not running")
+	if meta, ok := loadDaemonMeta(); ok {
+		if startedAt, err := time.Parse(time.RFC3339, meta.StartedAt); err == nil {
+			fmt.Printf("Last started at: %s\n", formatStatusTime(startedAt))
+		}
+	}
 }
 
 func stopDaemon() error {
@@ -533,6 +583,20 @@ func daemonRunning() (bool, int) {
 	return true, pid
 }
 
+func waitForDaemonStop(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		running, _ := daemonRunning()
+		if !running {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("daemon did not stop within %s", timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func readDaemonPid() (int, error) {
 	raw, err := os.ReadFile(daemonPidPath())
 	if err != nil {
@@ -550,26 +614,96 @@ func readDaemonPid() (int, error) {
 }
 
 func writeDaemonPid() error {
-	return writeDaemonPidWith(os.Getpid())
+	return writeDaemonPidWithStart(os.Getpid(), time.Now().UTC())
 }
 
 func writeDaemonPidWith(pid int) error {
+	return writeDaemonPidWithStart(pid, time.Now().UTC())
+}
+
+func writeDaemonPidWithStart(pid int, startedAt time.Time) error {
 	path := daemonPidPath()
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0o600)
+	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)), 0o600); err != nil {
+		return err
+	}
+	return saveDaemonMeta(daemonMeta{
+		PID:       pid,
+		StartedAt: startedAt.UTC().Format(time.RFC3339),
+	})
 }
 
 func removeDaemonPid() {
 	_ = os.Remove(daemonPidPath())
 }
 
+func removeDaemonState() {
+	removeDaemonPid()
+	_ = os.Remove(daemonMetaPath())
+}
+
 func daemonPidPath() string {
 	return filepath.Join(expandUser("~/.yiduo"), "daemon.pid")
 }
 
+func daemonMetaPath() string {
+	return filepath.Join(expandUser("~/.yiduo"), "daemon-meta.json")
+}
+
+func saveDaemonMeta(meta daemonMeta) error {
+	path := daemonMetaPath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func loadDaemonMeta() (daemonMeta, bool) {
+	raw, err := os.ReadFile(daemonMetaPath())
+	if err != nil {
+		return daemonMeta{}, false
+	}
+	var meta daemonMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return daemonMeta{}, false
+	}
+	if meta.PID == 0 || strings.TrimSpace(meta.StartedAt) == "" {
+		return daemonMeta{}, false
+	}
+	return meta, true
+}
+
+func daemonStartedAt(pid int) (time.Time, bool) {
+	meta, ok := loadDaemonMeta()
+	if ok && meta.PID == pid {
+		if startedAt, err := time.Parse(time.RFC3339, meta.StartedAt); err == nil {
+			return startedAt, true
+		}
+	}
+	if info, err := os.Stat(daemonPidPath()); err == nil {
+		return info.ModTime(), true
+	}
+	return time.Time{}, false
+}
+
+func formatStatusTime(ts time.Time) string {
+	return ts.Local().Format("2006-01-02 15:04:05 -0700")
+}
+
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String()
+}
 func daemonLogPath() string {
 	return filepath.Join(expandUser("~/.yiduo"), "sync.log")
 }

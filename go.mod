@@ -1,3 +1,3 @@
-module ai-wrapped-agent
+module yiduo
 
 go 1.22
