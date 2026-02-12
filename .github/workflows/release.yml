@@ -30,8 +30,9 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           BIN_NAME=yiduo
+          VERSION=${{ github.ref_name }}
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go build -trimpath -ldflags "-s -w" -o "dist/${BIN_NAME}" .
+            go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "dist/${BIN_NAME}" .
           tar -czf "dist/${BIN_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C dist "${BIN_NAME}"
           rm -f "dist/${BIN_NAME}"
 

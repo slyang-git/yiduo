@@ -89,8 +89,17 @@ type syncOptions struct {
 
 const daemonEnv = "YIDUO_DAEMON"
 
+var version = "dev"
+
 func main() {
 	args := os.Args[1:]
+	if len(args) > 0 {
+		first := strings.TrimSpace(args[0])
+		if first == "version" || first == "--version" || first == "-version" {
+			fmt.Println(version)
+			return
+		}
+	}
 	if len(args) > 0 && args[0] == "sync" {
 		args = args[1:]
 	}
