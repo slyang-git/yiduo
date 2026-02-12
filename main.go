@@ -98,7 +98,8 @@ func main() {
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
 	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|antigravity|droid (comma-separated)")
-	deviceToken := flag.String("device-token", "", "device token for sync authentication")
+	authToken := flag.String("auth-token", "", "auth token for sync authentication")
+	deviceToken := flag.String("device-token", "", "deprecated: use --auth-token")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
 	daemonShort := flag.Bool("d", false, "shorthand for --daemon")
 	codexRoot := flag.String("codex-root", envOrDefault("CODEX_ROOT", "~/.codex"), "Codex root")
@@ -200,7 +201,7 @@ func main() {
 		os.Exit(1)
 	}
 	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "https://yiduo.one/")
-	resolvedDeviceToken := firstNonEmpty(*deviceToken, os.Getenv("AI_WRAPPED_SYNC_TOKEN"), os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.DeviceToken)
+	resolvedDeviceToken := firstNonEmpty(*authToken, *deviceToken, os.Getenv("AI_WRAPPED_SYNC_TOKEN"), os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.AuthToken, config.LegacyDeviceToken)
 	deviceInfo := DeviceInfo{
 		ID:   config.DeviceID,
 		Name: *host,
@@ -2087,33 +2088,64 @@ type kiloUsage struct {
 	Cost        float64 `json:"cost"`
 }
 
+type kiloSessionIndex struct {
+	TaskSessionMap map[string]string `json:"taskSessionMap"`
+}
+
+type kiloStoragePaths struct {
+	tasksDir    string
+	sessionsDir string
+}
+
 func loadKiloCodeSessions(root string) ([]SyncSession, error) {
-	tasksDir := filepath.Join(root, "cli", "global", "tasks")
-	info, err := os.Stat(tasksDir)
-	if err != nil || !info.IsDir() {
-		return []SyncSession{}, nil
-	}
+	candidates := kiloStorageCandidates(root)
+	parsed := make(map[string]SyncSession)
+	order := make([]string, 0)
 
-	entries, err := os.ReadDir(tasksDir)
-	if err != nil {
-		return nil, err
-	}
-
-	var sessions []SyncSession
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate.tasksDir)
+		if err != nil || !info.IsDir() {
 			continue
 		}
-		taskDir := filepath.Join(tasksDir, entry.Name())
-		session, ok := parseKiloTask(taskDir, entry.Name())
-		if ok {
-			sessions = append(sessions, session)
+
+		taskSessionMap, err := loadKiloTaskSessionMap(candidate.sessionsDir)
+		if err != nil {
+			return nil, err
 		}
+
+		entries, err := os.ReadDir(candidate.tasksDir)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			taskID := entry.Name()
+			taskDir := filepath.Join(candidate.tasksDir, taskID)
+			session, ok := parseKiloTask(taskDir, taskID, taskSessionMap[taskID])
+			if !ok {
+				continue
+			}
+			if existing, ok := parsed[session.ID]; ok {
+				if kiloSessionScore(session) > kiloSessionScore(existing) {
+					parsed[session.ID] = session
+				}
+				continue
+			}
+			parsed[session.ID] = session
+			order = append(order, session.ID)
+		}
+	}
+
+	sessions := make([]SyncSession, 0, len(order))
+	for _, id := range order {
+		sessions = append(sessions, parsed[id])
 	}
 	return sessions, nil
 }
 
-func parseKiloTask(taskDir string, fallbackID string) (SyncSession, bool) {
+func parseKiloTask(taskDir string, fallbackID string, mappedSessionID string) (SyncSession, bool) {
 	uiPath := filepath.Join(taskDir, "ui_messages.json")
 	apiPath := filepath.Join(taskDir, "api_conversation_history.json")
 
@@ -2205,7 +2237,10 @@ func parseKiloTask(taskDir string, fallbackID string) (SyncSession, bool) {
 		}
 	}
 
-	id := fallbackID
+	id := strings.TrimSpace(mappedSessionID)
+	if id == "" {
+		id = fallbackID
+	}
 	if id == "" {
 		id = strconv.FormatInt(startedMs, 10)
 	}
@@ -2230,6 +2265,96 @@ func parseKiloTask(taskDir string, fallbackID string) (SyncSession, bool) {
 		session.StartedAt = session.EndedAt
 	}
 	return session, session.ID != ""
+}
+
+func kiloStorageCandidates(root string) []kiloStoragePaths {
+	seen := make(map[string]bool)
+	var candidates []kiloStoragePaths
+
+	add := func(base string) {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			return
+		}
+		base = expandUser(base)
+		paths := []kiloStoragePaths{
+			{
+				tasksDir:    filepath.Join(base, "tasks"),
+				sessionsDir: filepath.Join(base, "sessions"),
+			},
+			{
+				tasksDir:    filepath.Join(base, "cli", "global", "tasks"),
+				sessionsDir: filepath.Join(base, "cli", "global", "sessions"),
+			},
+		}
+		for _, path := range paths {
+			key := path.tasksDir + "::" + path.sessionsDir
+			if !seen[key] {
+				seen[key] = true
+				candidates = append(candidates, path)
+			}
+		}
+	}
+
+	add(root)
+
+	switch runtime.GOOS {
+	case "darwin":
+		add("~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code")
+	case "linux":
+		add("~/.vscode-server/data/User/globalStorage/kilocode.kilo-code")
+		add("~/.config/Code/User/globalStorage/kilocode.kilo-code")
+	}
+
+	return candidates
+}
+
+func loadKiloTaskSessionMap(sessionsDir string) (map[string]string, error) {
+	mapping := make(map[string]string)
+	info, err := os.Stat(sessionsDir)
+	if err != nil || !info.IsDir() {
+		return mapping, nil
+	}
+
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(sessionsDir, entry.Name(), "session.json")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var idx kiloSessionIndex
+		if err := json.Unmarshal(raw, &idx); err != nil {
+			continue
+		}
+		for taskID, sessionID := range idx.TaskSessionMap {
+			taskID = strings.TrimSpace(taskID)
+			sessionID = strings.TrimSpace(sessionID)
+			if taskID == "" || sessionID == "" {
+				continue
+			}
+			mapping[taskID] = sessionID
+		}
+	}
+	return mapping, nil
+}
+
+func kiloSessionScore(session SyncSession) int {
+	score := len(session.Messages) * 10
+	score += session.TotalTokens
+	if session.Cwd != "" {
+		score += 20
+	}
+	if session.Model != "" {
+		score += 10
+	}
+	return score
 }
 
 func parseKiloContentList(items []any) string {
@@ -4032,9 +4157,10 @@ func hostname() string {
 }
 
 type yiduoConfig struct {
-	DeviceToken string `json:"device_token"`
-	Server      string `json:"server"`
-	DeviceID    string `json:"device_id"`
+	AuthToken         string `json:"auth_token,omitempty"`
+	LegacyDeviceToken string `json:"device_token,omitempty"`
+	Server            string `json:"server"`
+	DeviceID          string `json:"device_id"`
 }
 
 func loadConfig() yiduoConfig {
@@ -4047,6 +4173,9 @@ func loadConfig() yiduoConfig {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return yiduoConfig{}
 	}
+	if strings.TrimSpace(cfg.AuthToken) == "" && strings.TrimSpace(cfg.LegacyDeviceToken) != "" {
+		cfg.AuthToken = strings.TrimSpace(cfg.LegacyDeviceToken)
+	}
 	return cfg
 }
 
@@ -4056,6 +4185,11 @@ func saveConfig(cfg yiduoConfig) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	if strings.TrimSpace(cfg.AuthToken) == "" && strings.TrimSpace(cfg.LegacyDeviceToken) != "" {
+		cfg.AuthToken = strings.TrimSpace(cfg.LegacyDeviceToken)
+	}
+	// Keep reading old `device_token`, but only write canonical `auth_token`.
+	cfg.LegacyDeviceToken = ""
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
