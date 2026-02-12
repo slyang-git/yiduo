@@ -2296,6 +2296,16 @@ func kiloStorageCandidates(root string) []kiloStoragePaths {
 		}
 	}
 
+	addFromGlob := func(pattern string) {
+		matches, err := filepath.Glob(expandUser(pattern))
+		if err != nil {
+			return
+		}
+		for _, path := range matches {
+			add(path)
+		}
+	}
+
 	add(root)
 
 	switch runtime.GOOS {
@@ -2303,7 +2313,12 @@ func kiloStorageCandidates(root string) []kiloStoragePaths {
 		add("~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code")
 	case "linux":
 		add("~/.vscode-server/data/User/globalStorage/kilocode.kilo-code")
+		add("~/.vscode-server-insiders/data/User/globalStorage/kilocode.kilo-code")
 		add("~/.config/Code/User/globalStorage/kilocode.kilo-code")
+		add("~/.config/Code - OSS/User/globalStorage/kilocode.kilo-code")
+		add("~/.config/VSCodium/User/globalStorage/kilocode.kilo-code")
+		addFromGlob("~/.config/*/User/globalStorage/kilocode.kilo-code")
+		addFromGlob("~/.vscode-server*/data/User/globalStorage/kilocode.kilo-code")
 	}
 
 	return candidates
