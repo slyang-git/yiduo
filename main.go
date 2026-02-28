@@ -2110,6 +2110,19 @@ func loadKiloCodeSessions(root string) ([]SyncSession, error) {
 	candidates := kiloStorageCandidates(root)
 	parsed := make(map[string]SyncSession)
 	order := make([]string, 0)
+	mergeSession := func(session SyncSession) {
+		if session.ID == "" {
+			return
+		}
+		if existing, ok := parsed[session.ID]; ok {
+			if kiloSessionScore(session) > kiloSessionScore(existing) {
+				parsed[session.ID] = session
+			}
+			return
+		}
+		parsed[session.ID] = session
+		order = append(order, session.ID)
+	}
 
 	for _, candidate := range candidates {
 		info, err := os.Stat(candidate.tasksDir)
@@ -2136,14 +2149,17 @@ func loadKiloCodeSessions(root string) ([]SyncSession, error) {
 			if !ok {
 				continue
 			}
-			if existing, ok := parsed[session.ID]; ok {
-				if kiloSessionScore(session) > kiloSessionScore(existing) {
-					parsed[session.ID] = session
-				}
-				continue
-			}
-			parsed[session.ID] = session
-			order = append(order, session.ID)
+			mergeSession(session)
+		}
+	}
+
+	for _, dbPath := range kiloDBCandidates(root) {
+		sessions, err := loadKiloDBSessions(dbPath)
+		if err != nil {
+			continue
+		}
+		for _, session := range sessions {
+			mergeSession(session)
 		}
 	}
 
@@ -2188,6 +2204,7 @@ func parseKiloTask(taskDir string, fallbackID string, mappedSessionID string) (S
 	var title string
 	var model string
 	var cwd string
+	modelCounts := map[string]int{}
 
 	if raw, err := os.ReadFile(apiPath); err == nil {
 		var entries []map[string]any
@@ -2206,6 +2223,9 @@ func parseKiloTask(taskDir string, fallbackID string, mappedSessionID string) (S
 				}
 				if model == "" {
 					model = extractTaggedValue(content, "model")
+				}
+				if modelName := strings.TrimSpace(extractTaggedValue(content, "model")); modelName != "" {
+					modelCounts[modelName]++
 				}
 				if cwd == "" {
 					cwd = extractWorkspaceDirectory(content)
@@ -2267,6 +2287,7 @@ func parseKiloTask(taskDir string, fallbackID string, mappedSessionID string) (S
 		TotalCachedInputTokens: tokens.cachedInputTokens,
 		Messages:               messages,
 	}
+	session.Model = pickDominantModel(modelCounts, session.Model)
 	if session.Title == "" {
 		session.Title = "KiloCode session"
 	}
@@ -2369,6 +2390,223 @@ func loadKiloTaskSessionMap(sessionsDir string) (map[string]string, error) {
 	return mapping, nil
 }
 
+func kiloDBCandidates(root string) []string {
+	seen := make(map[string]bool)
+	candidates := make([]string, 0, 2)
+	add := func(path string) {
+		path = expandUser(strings.TrimSpace(path))
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		candidates = append(candidates, path)
+	}
+
+	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(root)), ".db") {
+		add(root)
+	} else {
+		add(filepath.Join(root, "kilo.db"))
+	}
+	add("~/.local/share/kilo/kilo.db")
+	return candidates
+}
+
+func loadKiloDBSessions(dbPath string) ([]SyncSession, error) {
+	info, err := os.Stat(dbPath)
+	if err != nil || info.IsDir() {
+		return []SyncSession{}, nil
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return []SyncSession{}, nil
+	}
+
+	partRows, err := sqliteRows(dbPath, "SELECT message_id, hex(data) FROM part ORDER BY time_created ASC")
+	if err != nil {
+		return nil, err
+	}
+	partsByMessageID := make(map[string][]map[string]any, len(partRows))
+	for _, row := range partRows {
+		if len(row) < 2 {
+			continue
+		}
+		messageID := strings.TrimSpace(row[0])
+		if messageID == "" {
+			continue
+		}
+		raw, err := hex.DecodeString(strings.TrimSpace(row[1]))
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			continue
+		}
+		partsByMessageID[messageID] = append(partsByMessageID[messageID], payload)
+	}
+
+	sessionRows, err := sqliteRows(dbPath, "SELECT id, title, directory, time_created, time_updated FROM session")
+	if err != nil {
+		return nil, err
+	}
+
+	sessionByID := make(map[string]*SyncSession, len(sessionRows))
+	order := make([]string, 0, len(sessionRows))
+	startedMsByID := make(map[string]int64, len(sessionRows))
+	endedMsByID := make(map[string]int64, len(sessionRows))
+
+	for _, row := range sessionRows {
+		if len(row) < 5 {
+			continue
+		}
+		id := strings.TrimSpace(row[0])
+		if id == "" {
+			continue
+		}
+		startedMs := int64From(row[3], 0)
+		endedMs := int64From(row[4], 0)
+		session := SyncSession{
+			ID:        id,
+			Title:     strings.TrimSpace(row[1]),
+			Cwd:       normalizeCwd(row[2]),
+			StartedAt: formatMillis(startedMs),
+			EndedAt:   formatMillis(endedMs),
+		}
+		sessionByID[id] = &session
+		order = append(order, id)
+		startedMsByID[id] = startedMs
+		endedMsByID[id] = endedMs
+	}
+
+	messageRows, err := sqliteRows(dbPath, "SELECT id, session_id, time_created, time_updated, hex(data) FROM message ORDER BY time_created ASC")
+	if err != nil {
+		return nil, err
+	}
+	messageIndexBySessionID := map[string]int{}
+	modelCountsBySessionID := map[string]map[string]int{}
+	for _, row := range messageRows {
+		if len(row) < 5 {
+			continue
+		}
+		messageID := strings.TrimSpace(row[0])
+		sessionID := strings.TrimSpace(row[1])
+		if sessionID == "" {
+			continue
+		}
+
+		session := sessionByID[sessionID]
+		if session == nil {
+			sessionByID[sessionID] = &SyncSession{ID: sessionID}
+			session = sessionByID[sessionID]
+			order = append(order, sessionID)
+		}
+
+		raw, err := hex.DecodeString(strings.TrimSpace(row[4]))
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			continue
+		}
+
+		role := strings.TrimSpace(stringFrom(payload["role"]))
+		if role == "" {
+			continue
+		}
+
+		timeInfo := mapFrom(payload["time"])
+		createdMs := int64From(timeInfo["created"], int64From(row[2], 0))
+		endedMs := int64From(timeInfo["completed"], int64From(row[3], 0))
+		if endedMs == 0 {
+			endedMs = createdMs
+		}
+
+		if startedMsByID[sessionID] == 0 || (createdMs > 0 && createdMs < startedMsByID[sessionID]) {
+			startedMsByID[sessionID] = createdMs
+		}
+		if endedMsByID[sessionID] == 0 || endedMs > endedMsByID[sessionID] {
+			endedMsByID[sessionID] = endedMs
+		}
+
+		if session.Model == "" {
+			session.Model = strings.TrimSpace(firstStringFromMap(payload, "modelID"))
+			if session.Model == "" {
+				model := mapFrom(payload["model"])
+				session.Model = strings.TrimSpace(firstStringFromMap(model, "modelID", "id"))
+			}
+		}
+		modelName := strings.TrimSpace(firstStringFromMap(payload, "modelID"))
+		if modelName == "" {
+			modelName = strings.TrimSpace(firstStringFromMap(mapFrom(payload["model"]), "modelID", "id"))
+		}
+		if modelName != "" && role == "assistant" {
+			if modelCountsBySessionID[sessionID] == nil {
+				modelCountsBySessionID[sessionID] = map[string]int{}
+			}
+			modelCountsBySessionID[sessionID][modelName]++
+		}
+		if session.Cwd == "" {
+			pathInfo := mapFrom(payload["path"])
+			session.Cwd = normalizeCwd(firstStringFromMap(pathInfo, "cwd", "root"))
+		}
+
+		tokens := mapFrom(payload["tokens"])
+		session.TotalInputTokens += intFrom(tokens["input"], 0)
+		session.TotalOutputTokens += intFrom(tokens["output"], 0)
+		session.TotalReasoningTokens += intFrom(tokens["reasoning"], 0)
+		session.TotalCachedInputTokens += intFrom(mapFrom(tokens["cache"])["read"], 0)
+
+		content := parseKiloDBPartContent(partsByMessageID[messageID])
+		if content == "" {
+			continue
+		}
+		if session.Title == "" && role == "user" {
+			session.Title = content
+		}
+		index := messageIndexBySessionID[sessionID]
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:     index,
+			Role:      role,
+			Content:   content,
+			Timestamp: formatMillis(createdMs),
+		})
+		messageIndexBySessionID[sessionID] = index + 1
+	}
+
+	sessions := make([]SyncSession, 0, len(order))
+	for _, id := range order {
+		session := sessionByID[id]
+		if session == nil || session.ID == "" {
+			continue
+		}
+		startedMs := startedMsByID[id]
+		endedMs := endedMsByID[id]
+		if startedMs > 0 {
+			session.StartedAt = formatMillis(startedMs)
+		}
+		if endedMs > 0 {
+			session.EndedAt = formatMillis(endedMs)
+		}
+		if session.StartedAt == "" {
+			session.StartedAt = session.EndedAt
+		}
+		if session.EndedAt == "" {
+			session.EndedAt = session.StartedAt
+		}
+		session.Model = pickDominantModel(modelCountsBySessionID[id], session.Model)
+		session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens + session.TotalReasoningTokens
+		if session.Title == "" {
+			if session.Cwd != "" {
+				session.Title = session.Cwd
+			} else {
+				session.Title = "KiloCode session"
+			}
+		}
+		sessions = append(sessions, *session)
+	}
+	return sessions, nil
+}
+
 func kiloSessionScore(session SyncSession) int {
 	score := len(session.Messages) * 10
 	score += session.TotalTokens
@@ -2408,6 +2646,58 @@ func parseKiloContentList(items []any) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func parseKiloDBPartContent(items []map[string]any) string {
+	if len(items) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, entry := range items {
+		switch strings.TrimSpace(stringFrom(entry["type"])) {
+		case "text", "reasoning":
+			if text := strings.TrimSpace(stringFrom(entry["text"])); text != "" {
+				parts = append(parts, text)
+			}
+		case "tool":
+			state := mapFrom(entry["state"])
+			input := mapFrom(state["input"])
+			command := strings.TrimSpace(firstStringFromMap(input, "command", "description"))
+			if command != "" {
+				parts = append(parts, command)
+			}
+		case "patch":
+			filesList, _ := entry["files"].([]any)
+			for _, file := range filesList {
+				if path := strings.TrimSpace(stringFrom(file)); path != "" {
+					parts = append(parts, path)
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func pickDominantModel(modelCounts map[string]int, fallback string) string {
+	if len(modelCounts) == 0 {
+		return strings.TrimSpace(fallback)
+	}
+	bestModel := strings.TrimSpace(fallback)
+	bestCount := 0
+	for model, count := range modelCounts {
+		model = strings.TrimSpace(model)
+		if model == "" || count <= 0 {
+			continue
+		}
+		if count > bestCount || (count == bestCount && (bestModel == "" || model < bestModel)) {
+			bestModel = model
+			bestCount = count
+		}
+	}
+	if bestModel == "" {
+		return strings.TrimSpace(fallback)
+	}
+	return bestModel
 }
 
 func extractTaggedValue(content string, tag string) string {
