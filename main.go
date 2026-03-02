@@ -106,7 +106,7 @@ func main() {
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
-	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|antigravity|droid (comma-separated)")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|antigravity|droid (comma-separated)")
 	authToken := flag.String("auth-token", "", "auth token for sync authentication")
 	deviceToken := flag.String("device-token", "", "deprecated: use --auth-token")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
@@ -122,6 +122,7 @@ func main() {
 	ampRoot := flag.String("amp-root", envOrDefault("AMP_ROOT", "~/.local/share/amp"), "Amp root")
 	opencodeRoot := flag.String("opencode-root", envOrDefault("OPENCODE_ROOT", "~/.local/share/opencode"), "OpenCode root")
 	piRoot := flag.String("pi-root", envOrDefault("PI_ROOT", "~/.pi"), "PI root")
+	openclawRoot := flag.String("openclaw-root", envOrDefault("OPENCLAW_ROOT", "~/.openclaw"), "OpenClaw root")
 	antigravityRoot := flag.String("antigravity-root", envOrDefault("ANTIGRAVITY_ROOT", "~/.gemini/antigravity"), "Antigravity root")
 	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
 	agentID := flag.String("agent-id", "local", "agent id")
@@ -260,6 +261,7 @@ func main() {
 			ampRoot:         expandUser(*ampRoot),
 			opencodeRoot:    expandUser(*opencodeRoot),
 			piRoot:          expandUser(*piRoot),
+			openclawRoot:    expandUser(*openclawRoot),
 			antigravityRoot: expandUser(*antigravityRoot),
 			droidRoot:       expandUser(*droidRoot),
 			logf:            options.logf,
@@ -320,6 +322,7 @@ type syncParams struct {
 	ampRoot         string
 	opencodeRoot    string
 	piRoot          string
+	openclawRoot    string
 	antigravityRoot string
 	droidRoot       string
 	logf            func(format string, args ...any)
@@ -358,6 +361,8 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			sessions, err = loadOpenCodeSessions(params.opencodeRoot)
 		case "pi":
 			sessions, err = loadPiSessions(params.piRoot)
+		case "openclaw":
+			sessions, err = loadOpenClawSessions(params.openclawRoot)
 		case "antigravity":
 			sessions, err = loadAntigravitySessions(params.antigravityRoot)
 		case "droid":
@@ -3480,6 +3485,31 @@ func loadPiSessions(root string) ([]SyncSession, error) {
 	return sessions, nil
 }
 
+func loadOpenClawSessions(root string) ([]SyncSession, error) {
+	sessionsDir := filepath.Join(root, "agents", "main", "sessions")
+	info, err := os.Stat(sessionsDir)
+	if err != nil || !info.IsDir() {
+		fallback := filepath.Join(root, "sessions")
+		if stat, statErr := os.Stat(fallback); statErr == nil && stat.IsDir() {
+			sessionsDir = fallback
+		}
+	}
+
+	entries, err := listJSONL(sessionsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	sessions := make([]SyncSession, 0, len(entries))
+	for _, path := range entries {
+		session, ok := parseOpenClawSession(path)
+		if ok {
+			sessions = append(sessions, session)
+		}
+	}
+	return sessions, nil
+}
+
 func parsePiSession(path string) (SyncSession, bool) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -3582,6 +3612,17 @@ func parsePiSession(path string) (SyncSession, bool) {
 		} else {
 			session.Title = "PI session"
 		}
+	}
+	return session, true
+}
+
+func parseOpenClawSession(path string) (SyncSession, bool) {
+	session, ok := parsePiSession(path)
+	if !ok {
+		return SyncSession{}, false
+	}
+	if session.Title == "PI session" {
+		session.Title = "OpenClaw session"
 	}
 	return session, true
 }
@@ -4668,6 +4709,7 @@ func parseSources(value string) ([]string, error) {
 			"amp",
 			"opencode",
 			"pi",
+			"openclaw",
 			"antigravity",
 			"droid",
 		}, nil
@@ -4685,6 +4727,7 @@ func parseSources(value string) ([]string, error) {
 		"amp":         true,
 		"opencode":    true,
 		"pi":          true,
+		"openclaw":    true,
 		"antigravity": true,
 		"droid":       true,
 	}
@@ -4708,6 +4751,7 @@ func parseSources(value string) ([]string, error) {
 				"amp",
 				"opencode",
 				"pi",
+				"openclaw",
 				"antigravity",
 				"droid",
 			}, nil
@@ -4750,6 +4794,8 @@ func defaultToolName(source string) string {
 		return "opencode"
 	case "pi":
 		return "pi"
+	case "openclaw":
+		return "openclaw"
 	case "antigravity":
 		return "antigravity"
 	case "droid":

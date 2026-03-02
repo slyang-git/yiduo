@@ -41,3 +41,9 @@ yiduo sync status
 yiduo sync stop
 yiduo sync restart
 ```
+
+Sync a specific source (for example OpenClaw sessions from `~/.openclaw/agents/main/sessions`):
+
+```sh
+yiduo sync --source openclaw
+```
