@@ -104,6 +104,10 @@ func main() {
 			fmt.Println(version)
 			return
 		}
+		if first == "status" {
+			printDaemonStatus()
+			return
+		}
 		if helpRequested(first) {
 			printHelp()
 			return
@@ -151,13 +155,10 @@ func main() {
 	if len(extraArgs) > 0 {
 		if !hasSyncCommand {
 			fmt.Fprintf(os.Stderr, "unknown command: %s\n", extraArgs[0])
-			fmt.Fprintln(os.Stderr, "hint: use subcommands under `yiduo sync ...`")
+			fmt.Fprintln(os.Stderr, "hint: use `yiduo status` or subcommands under `yiduo sync ...`")
 			os.Exit(2)
 		}
 		switch extraArgs[0] {
-		case "status":
-			printDaemonStatus()
-			return
 		case "log":
 			if err := tailSyncLog(); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to tail sync log: %v\n", err)
@@ -209,6 +210,11 @@ func main() {
 			fmt.Println("yiduo sync daemon restarted")
 			return
 		default:
+			if extraArgs[0] == "status" {
+				fmt.Fprintln(os.Stderr, "unknown command: status")
+				fmt.Fprintln(os.Stderr, "hint: use `yiduo status`")
+				os.Exit(2)
+			}
 			fmt.Fprintf(os.Stderr, "unknown command: %s\n", extraArgs[0])
 			os.Exit(2)
 		}
@@ -337,17 +343,18 @@ Command format:
 
 Usage:
   %s sync [flags]
-  %s sync [status|start|stop|restart|log]
+  %s sync [start|stop|restart|log]
+  %s status
   %s [--help|-h|help]
   %s [--version|version]
 
 Commands:
   sync        Run one-off sync, or use sync subcommands
+  status      Show daemon status
   help        Show this help
   version     Show version
 
 Sync Subcommands:
-  yiduo sync status     Show daemon status
   yiduo sync start      Start daemon mode
   yiduo sync stop       Stop daemon mode
   yiduo sync restart    Restart daemon mode
@@ -369,12 +376,12 @@ Root Path Flags:
   --antigravity-root --droid-root
 
 Examples:
+  %s status
   %s sync
   %s sync --source openclaw
   %s sync --daemon
-  %s sync status
   %s sync log
-`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
+`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
 }
 
 type syncParams struct {
@@ -632,15 +639,18 @@ func spawnDaemon() error {
 }
 
 func printDaemonStatus() {
+	fmt.Printf("Version: %s\n", version)
 	if running, pid := daemonRunning(); running {
 		fmt.Printf("yiduo sync daemon running (pid %d)\n", pid)
 		if startedAt, ok := daemonStartedAt(pid); ok {
 			fmt.Printf("Started at: %s\n", formatStatusTime(startedAt))
-			fmt.Printf("Uptime: %s\n", formatDuration(time.Since(startedAt)))
+			fmt.Printf("Uptime: %s\n", formatHumanDuration(time.Since(startedAt)))
 		}
 		return
 	}
 	fmt.Println("yiduo sync daemon not running")
+	fmt.Println("Started at: -")
+	fmt.Println("Uptime: -")
 	if meta, ok := loadDaemonMeta(); ok {
 		if startedAt, err := time.Parse(time.RFC3339, meta.StartedAt); err == nil {
 			fmt.Printf("Last started at: %s\n", formatStatusTime(startedAt))
@@ -797,6 +807,17 @@ func formatDuration(d time.Duration) string {
 		d = 0
 	}
 	return d.Round(time.Second).String()
+}
+
+func formatHumanDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	totalMinutes := int64(d / time.Minute)
+	days := totalMinutes / (24 * 60)
+	hours := (totalMinutes % (24 * 60)) / 60
+	minutes := totalMinutes % 60
+	return fmt.Sprintf("%ddays %dhours %dmin", days, hours, minutes)
 }
 func daemonLogPath() string {
 	return filepath.Join(expandUser("~/.yiduo"), "sync.log")

@@ -37,7 +37,7 @@ yiduo sync --daemon
 Check daemon status or stop it:
 
 ```sh
-yiduo sync status
+yiduo status
 yiduo sync stop
 yiduo sync restart
 yiduo sync log
