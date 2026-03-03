@@ -161,7 +161,7 @@ func main() {
 		switch extraArgs[0] {
 		case "log":
 			if err := tailSyncLog(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to tail sync log: %v\n", err)
+				fmt.Fprintf(os.Stderr, "❌ failed to tail sync log: %v\n", err)
 				os.Exit(1)
 			}
 			return
@@ -639,23 +639,23 @@ func spawnDaemon() error {
 }
 
 func printDaemonStatus() {
-	fmt.Printf("Version: %s\n", version)
-	fmt.Printf("Install path: %s\n", executablePath())
-	fmt.Printf("Config path: %s\n", configPath())
+	fmt.Printf("🔖 Version: %s\n", version)
+	fmt.Printf("📦 Install path: %s\n", executablePath())
+	fmt.Printf("⚙️  Config path: %s\n", configPath())
 	if running, pid := daemonRunning(); running {
-		fmt.Printf("yiduo sync daemon running (pid %d)\n", pid)
+		fmt.Printf("🟢 Daemon: running (pid %d)\n", pid)
 		if startedAt, ok := daemonStartedAt(pid); ok {
-			fmt.Printf("Started at: %s\n", formatStatusTime(startedAt))
-			fmt.Printf("Uptime: %s\n", formatHumanDuration(time.Since(startedAt)))
+			fmt.Printf("🕒 Started at: %s\n", formatStatusTime(startedAt))
+			fmt.Printf("⏱️  Uptime: %s\n", formatHumanDuration(time.Since(startedAt)))
 		}
 		return
 	}
-	fmt.Println("yiduo sync daemon not running")
-	fmt.Println("Started at: -")
-	fmt.Println("Uptime: -")
+	fmt.Println("🔴 Daemon: not running")
+	fmt.Println("🕒 Started at: -")
+	fmt.Println("⏱️  Uptime: -")
 	if meta, ok := loadDaemonMeta(); ok {
 		if startedAt, err := time.Parse(time.RFC3339, meta.StartedAt); err == nil {
-			fmt.Printf("Last started at: %s\n", formatStatusTime(startedAt))
+			fmt.Printf("📝 Last started at: %s\n", formatStatusTime(startedAt))
 		}
 	}
 }
@@ -847,7 +847,7 @@ func openDaemonLog() (*os.File, error) {
 
 func tailSyncLog() error {
 	path := daemonLogPath()
-	fmt.Printf("following %s (Ctrl+C to stop)\n", path)
+	fmt.Printf("📜 Following %s (Ctrl+C to stop)\n", path)
 	if err := printLogTail(path, 10); err != nil {
 		return err
 	}
