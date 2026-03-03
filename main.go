@@ -640,6 +640,8 @@ func spawnDaemon() error {
 
 func printDaemonStatus() {
 	fmt.Printf("Version: %s\n", version)
+	fmt.Printf("Install path: %s\n", executablePath())
+	fmt.Printf("Config path: %s\n", configPath())
 	if running, pid := daemonRunning(); running {
 		fmt.Printf("yiduo sync daemon running (pid %d)\n", pid)
 		if startedAt, ok := daemonStartedAt(pid); ok {
@@ -818,6 +820,17 @@ func formatHumanDuration(d time.Duration) string {
 	hours := (totalMinutes % (24 * 60)) / 60
 	minutes := totalMinutes % 60
 	return fmt.Sprintf("%ddays %dhours %dmin", days, hours, minutes)
+}
+
+func executablePath() string {
+	path, err := os.Executable()
+	if err != nil || strings.TrimSpace(path) == "" {
+		return "unknown"
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil && strings.TrimSpace(resolved) != "" {
+		return resolved
+	}
+	return path
 }
 func daemonLogPath() string {
 	return filepath.Join(expandUser("~/.yiduo"), "sync.log")
