@@ -93,16 +93,30 @@ var version = "dev"
 
 func main() {
 	args := os.Args[1:]
+	hasSyncCommand := len(args) > 0 && strings.TrimSpace(args[0]) == "sync"
+	helpRequested := func(value string) bool {
+		v := strings.TrimSpace(value)
+		return v == "help" || v == "--help" || v == "-h"
+	}
 	if len(args) > 0 {
 		first := strings.TrimSpace(args[0])
 		if first == "version" || first == "--version" || first == "-version" {
 			fmt.Println(version)
 			return
 		}
+		if helpRequested(first) {
+			printHelp()
+			return
+		}
+		if first == "sync" && len(args) > 1 && helpRequested(args[1]) {
+			printHelp()
+			return
+		}
 	}
-	if len(args) > 0 && args[0] == "sync" {
+	if hasSyncCommand {
 		args = args[1:]
 	}
+	flag.CommandLine.Usage = printHelp
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
@@ -135,9 +149,20 @@ func main() {
 	forceDaemonStart := false
 	isDaemonWorker := os.Getenv(daemonEnv) != ""
 	if len(extraArgs) > 0 {
+		if !hasSyncCommand {
+			fmt.Fprintf(os.Stderr, "unknown command: %s\n", extraArgs[0])
+			fmt.Fprintln(os.Stderr, "hint: use subcommands under `yiduo sync ...`")
+			os.Exit(2)
+		}
 		switch extraArgs[0] {
 		case "status":
 			printDaemonStatus()
+			return
+		case "log":
+			if err := tailSyncLog(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to tail sync log: %v\n", err)
+				os.Exit(1)
+			}
 			return
 		case "stop":
 			if running, pid := daemonRunning(); running {
@@ -301,6 +326,55 @@ func main() {
 	} else {
 		fmt.Printf("Synced %d sessions across %d tools to %s\n", totalSessions, len(sources), resolvedServer)
 	}
+}
+
+func printHelp() {
+	bin := filepath.Base(os.Args[0])
+	fmt.Printf(`%s - Device sync agent for AI Wrapped
+
+Command format:
+  %s [flags] command [command-flags]
+
+Usage:
+  %s sync [flags]
+  %s sync [status|start|stop|restart|log]
+  %s [--help|-h|help]
+  %s [--version|version]
+
+Commands:
+  sync        Run one-off sync, or use sync subcommands
+  help        Show this help
+  version     Show version
+
+Sync Subcommands:
+  yiduo sync status     Show daemon status
+  yiduo sync start      Start daemon mode
+  yiduo sync stop       Stop daemon mode
+  yiduo sync restart    Restart daemon mode
+  yiduo sync log        Follow daemon log (~/.yiduo/sync.log)
+
+Key Flags:
+  --source string        Data source(s), comma-separated.
+                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|antigravity|droid
+  --daemon, -d           Run sync daemon in background
+  --server string        API server base URL
+  --auth-token string    Sync auth token
+  --tool string          Tool name override (single source only)
+  --agent-id string      Agent id (default: local)
+  --host string          Host name
+
+Root Path Flags:
+  --codex-root --claude-root --gemini-root --qwen-root --cline-root --continue-root
+  --kilocode-root --cursor-root --amp-root --opencode-root --pi-root --openclaw-root
+  --antigravity-root --droid-root
+
+Examples:
+  %s sync
+  %s sync --source openclaw
+  %s sync --daemon
+  %s sync status
+  %s sync log
+`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
 }
 
 type syncParams struct {
@@ -735,6 +809,134 @@ func openDaemonLog() (*os.File, error) {
 		return nil, err
 	}
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+}
+
+func tailSyncLog() error {
+	path := daemonLogPath()
+	fmt.Printf("following %s (Ctrl+C to stop)\n", path)
+	if err := printLogTail(path, 10); err != nil {
+		return err
+	}
+	return followLog(path)
+}
+
+func printLogTail(path string, lines int) error {
+	if lines <= 0 {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	size := info.Size()
+	if size <= 0 {
+		return nil
+	}
+
+	const maxTailBytes int64 = 1 << 20
+	start := int64(0)
+	if size > maxTailBytes {
+		start = size - maxTailBytes
+	}
+	buf := make([]byte, size-start)
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if _, err := file.ReadAt(buf, start); err != nil && err != io.EOF {
+		return err
+	}
+	if start > 0 {
+		if idx := bytes.IndexByte(buf, '\n'); idx >= 0 && idx+1 < len(buf) {
+			buf = buf[idx+1:]
+		}
+	}
+
+	chunks := strings.Split(string(buf), "\n")
+	if len(chunks) > 0 && chunks[len(chunks)-1] == "" {
+		chunks = chunks[:len(chunks)-1]
+	}
+	if len(chunks) > lines {
+		chunks = chunks[len(chunks)-lines:]
+	}
+	for _, line := range chunks {
+		fmt.Println(line)
+	}
+	return nil
+}
+
+func followLog(path string) error {
+	ticker := time.NewTicker(400 * time.Millisecond)
+	defer ticker.Stop()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+
+	var offset int64
+	if info, err := os.Stat(path); err == nil {
+		offset = info.Size()
+	}
+
+	for {
+		select {
+		case <-stop:
+			return nil
+		case <-ticker.C:
+			info, err := os.Stat(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					offset = 0
+					continue
+				}
+				return err
+			}
+
+			size := info.Size()
+			if size < offset {
+				offset = 0
+			}
+			if size == offset {
+				continue
+			}
+
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			if _, err := file.Seek(offset, io.SeekStart); err != nil {
+				file.Close()
+				return err
+			}
+
+			reader := bufio.NewReader(file)
+			for {
+				line, err := reader.ReadString('\n')
+				if line != "" {
+					fmt.Print(line)
+				}
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					file.Close()
+					return err
+				}
+			}
+
+			next, err := file.Seek(0, io.SeekCurrent)
+			file.Close()
+			if err != nil {
+				return err
+			}
+			offset = next
+		}
+	}
 }
 
 func logDaemonf(file *os.File, format string, args ...any) {

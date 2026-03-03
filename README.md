@@ -40,6 +40,7 @@ Check daemon status or stop it:
 yiduo sync status
 yiduo sync stop
 yiduo sync restart
+yiduo sync log
 ```
 
 Sync a specific source (for example OpenClaw sessions from `~/.openclaw/agents/main/sessions`):
