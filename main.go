@@ -124,7 +124,7 @@ func main() {
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
-	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|antigravity|droid (comma-separated)")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid (comma-separated)")
 	authToken := flag.String("auth-token", "", "auth token for sync authentication")
 	deviceToken := flag.String("device-token", "", "deprecated: use --auth-token")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
@@ -141,6 +141,7 @@ func main() {
 	opencodeRoot := flag.String("opencode-root", envOrDefault("OPENCODE_ROOT", "~/.local/share/opencode"), "OpenCode root")
 	piRoot := flag.String("pi-root", envOrDefault("PI_ROOT", "~/.pi"), "PI root")
 	openclawRoot := flag.String("openclaw-root", envOrDefault("OPENCLAW_ROOT", "~/.openclaw"), "OpenClaw root")
+	crushRoot := flag.String("crush-root", envOrDefault("CRUSH_ROOT", "~/.crush"), "Crush root")
 	antigravityRoot := flag.String("antigravity-root", envOrDefault("ANTIGRAVITY_ROOT", "~/.gemini/antigravity"), "Antigravity root")
 	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
 	agentID := flag.String("agent-id", "local", "agent id")
@@ -293,6 +294,7 @@ func main() {
 			opencodeRoot:    expandUser(*opencodeRoot),
 			piRoot:          expandUser(*piRoot),
 			openclawRoot:    expandUser(*openclawRoot),
+			crushRoot:       expandUser(*crushRoot),
 			antigravityRoot: expandUser(*antigravityRoot),
 			droidRoot:       expandUser(*droidRoot),
 			logf:            options.logf,
@@ -362,7 +364,7 @@ Sync Subcommands:
 
 Key Flags:
   --source string        Data source(s), comma-separated.
-                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|antigravity|droid
+                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid
   --daemon, -d           Run sync daemon in background
   --server string        API server base URL
   --auth-token string    Sync auth token
@@ -372,7 +374,7 @@ Key Flags:
 
 Root Path Flags:
   --codex-root --claude-root --gemini-root --qwen-root --cline-root --continue-root
-  --kilocode-root --cursor-root --amp-root --opencode-root --pi-root --openclaw-root
+  --kilocode-root --cursor-root --amp-root --opencode-root --pi-root --openclaw-root --crush-root
   --antigravity-root --droid-root
 
 Examples:
@@ -404,6 +406,7 @@ type syncParams struct {
 	opencodeRoot    string
 	piRoot          string
 	openclawRoot    string
+	crushRoot       string
 	antigravityRoot string
 	droidRoot       string
 	logf            func(format string, args ...any)
@@ -444,6 +447,8 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			sessions, err = loadPiSessions(params.piRoot)
 		case "openclaw":
 			sessions, err = loadOpenClawSessions(params.openclawRoot)
+		case "crush":
+			sessions, err = loadCrushSessions(params.crushRoot)
 		case "antigravity":
 			sessions, err = loadAntigravitySessions(params.antigravityRoot)
 		case "droid":
@@ -3846,6 +3851,207 @@ func loadOpenClawSessions(root string) ([]SyncSession, error) {
 	return sessions, nil
 }
 
+func loadCrushSessions(root string) ([]SyncSession, error) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return []SyncSession{}, nil
+	}
+
+	dbPath := strings.TrimSpace(root)
+	if dbPath == "" {
+		dbPath = filepath.Join(expandUser("~/.crush"), "crush.db")
+	}
+	if stat, err := os.Stat(dbPath); err == nil && !stat.IsDir() && strings.HasSuffix(strings.ToLower(dbPath), ".db") {
+		// root is already a db file path.
+	} else {
+		dbPath = filepath.Join(root, "crush.db")
+	}
+	info, err := os.Stat(dbPath)
+	if err != nil || info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	sessionRows, err := sqliteRows(dbPath, "SELECT id, title, prompt_tokens, completion_tokens, created_at, updated_at FROM sessions")
+	if err != nil {
+		return nil, err
+	}
+
+	sessionByID := make(map[string]*SyncSession, len(sessionRows))
+	order := make([]string, 0, len(sessionRows))
+	for _, row := range sessionRows {
+		if len(row) < 6 {
+			continue
+		}
+		id := strings.TrimSpace(row[0])
+		if id == "" {
+			continue
+		}
+		session := &SyncSession{
+			ID:                id,
+			Title:             strings.TrimSpace(row[1]),
+			TotalInputTokens:  intFrom(row[2], 0),
+			TotalOutputTokens: intFrom(row[3], 0),
+			StartedAt:         formatUnixFlexible(row[4]),
+			EndedAt:           formatUnixFlexible(row[5]),
+		}
+		session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
+		sessionByID[id] = session
+		order = append(order, id)
+	}
+
+	messageRows, err := sqliteRows(dbPath, "SELECT session_id, role, model, parts, created_at, updated_at FROM messages ORDER BY created_at ASC")
+	if err != nil {
+		return nil, err
+	}
+	messageIndexBySessionID := map[string]int{}
+	modelCountsBySessionID := map[string]map[string]int{}
+	for _, row := range messageRows {
+		if len(row) < 6 {
+			continue
+		}
+		sessionID := strings.TrimSpace(row[0])
+		if sessionID == "" {
+			continue
+		}
+		session := sessionByID[sessionID]
+		if session == nil {
+			session = &SyncSession{ID: sessionID}
+			sessionByID[sessionID] = session
+			order = append(order, sessionID)
+		}
+
+		role := strings.ToLower(strings.TrimSpace(row[1]))
+		if role == "" {
+			role = "assistant"
+		}
+		model := strings.TrimSpace(row[2])
+		if model != "" {
+			if modelCountsBySessionID[sessionID] == nil {
+				modelCountsBySessionID[sessionID] = map[string]int{}
+			}
+			modelCountsBySessionID[sessionID][model]++
+		}
+
+		timestamp := formatUnixFlexible(row[4])
+		if timestamp == "" {
+			timestamp = formatUnixFlexible(row[5])
+		}
+		if timestamp != "" {
+			if session.StartedAt == "" || timestamp < session.StartedAt {
+				session.StartedAt = timestamp
+			}
+			if session.EndedAt == "" || timestamp > session.EndedAt {
+				session.EndedAt = timestamp
+			}
+		}
+
+		content := parseCrushParts(row[3])
+		if content == "" {
+			continue
+		}
+		index := messageIndexBySessionID[sessionID]
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:     index,
+			Role:      role,
+			Content:   content,
+			Timestamp: timestamp,
+		})
+		messageIndexBySessionID[sessionID] = index + 1
+		if session.Title == "" && role == "user" {
+			session.Title = content
+		}
+	}
+
+	sessions := make([]SyncSession, 0, len(order))
+	for _, id := range order {
+		session := sessionByID[id]
+		if session == nil || session.ID == "" {
+			continue
+		}
+		session.Model = pickDominantModel(modelCountsBySessionID[id], session.Model)
+		if session.Title == "" {
+			session.Title = "Crush session"
+		}
+		if session.StartedAt == "" {
+			session.StartedAt = session.EndedAt
+		}
+		if session.EndedAt == "" {
+			session.EndedAt = session.StartedAt
+		}
+		session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens + session.TotalReasoningTokens
+		sessions = append(sessions, *session)
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+	return sessions, nil
+}
+
+func parseCrushParts(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var partsData []map[string]any
+	if err := json.Unmarshal([]byte(raw), &partsData); err != nil {
+		return ""
+	}
+
+	parts := make([]string, 0, len(partsData))
+	for _, part := range partsData {
+		partType := strings.TrimSpace(stringFrom(part["type"]))
+		data := mapFrom(part["data"])
+		switch partType {
+		case "text":
+			text := strings.TrimSpace(stringFrom(data["text"]))
+			if text != "" {
+				parts = append(parts, text)
+			}
+		case "tool_call":
+			name := strings.TrimSpace(stringFrom(data["name"]))
+			inputText := stringifyJSON(data["input"])
+			if name == "" {
+				name = "tool"
+			}
+			if inputText == "" {
+				parts = append(parts, fmt.Sprintf("[tool_call] %s", name))
+			} else {
+				parts = append(parts, fmt.Sprintf("[tool_call] %s\n%s", name, inputText))
+			}
+		case "tool_result":
+			contentText := strings.TrimSpace(stringFrom(data["content"]))
+			if contentText == "" {
+				contentText = stringifyJSON(data["content"])
+			}
+			if contentText == "" {
+				parts = append(parts, "[tool_result]")
+			} else {
+				parts = append(parts, fmt.Sprintf("[tool_result]\n%s", contentText))
+			}
+		case "finish":
+			reason := strings.TrimSpace(stringFrom(data["reason"]))
+			message := strings.TrimSpace(stringFrom(data["message"]))
+			details := strings.TrimSpace(stringFrom(data["details"]))
+			if message != "" || details != "" {
+				parts = append(parts, fmt.Sprintf("[finish] %s %s %s", reason, message, details))
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func formatUnixFlexible(value any) string {
+	raw := int64From(value, 0)
+	if raw <= 0 {
+		return ""
+	}
+	// Crush timestamps can be stored as seconds or milliseconds.
+	if raw < 1_000_000_000_000 {
+		raw = raw * 1000
+	}
+	return time.UnixMilli(raw).UTC().Format(time.RFC3339)
+}
+
 func parsePiSession(path string) (SyncSession, bool) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -5046,6 +5252,7 @@ func parseSources(value string) ([]string, error) {
 			"opencode",
 			"pi",
 			"openclaw",
+			"crush",
 			"antigravity",
 			"droid",
 		}, nil
@@ -5064,6 +5271,7 @@ func parseSources(value string) ([]string, error) {
 		"opencode":    true,
 		"pi":          true,
 		"openclaw":    true,
+		"crush":       true,
 		"antigravity": true,
 		"droid":       true,
 	}
@@ -5088,6 +5296,7 @@ func parseSources(value string) ([]string, error) {
 				"opencode",
 				"pi",
 				"openclaw",
+				"crush",
 				"antigravity",
 				"droid",
 			}, nil
@@ -5132,6 +5341,8 @@ func defaultToolName(source string) string {
 		return "pi"
 	case "openclaw":
 		return "openclaw"
+	case "crush":
+		return "crush"
 	case "antigravity":
 		return "antigravity"
 	case "droid":
