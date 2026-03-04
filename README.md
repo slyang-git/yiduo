@@ -34,6 +34,8 @@ Run a background daemon that syncs every minute:
 yiduo sync --daemon
 ```
 
+If a daemon is already running, this command will restart it so the latest installed binary takes effect immediately.
+
 Check daemon status or stop it:
 
 ```sh

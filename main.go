@@ -225,8 +225,15 @@ func main() {
 	daemonWorker := daemonEnabled && isDaemonWorker
 	if daemonEnabled && !daemonWorker {
 		if running, pid := daemonRunning(); running {
-			fmt.Printf("yiduo sync daemon already running (pid %d)\n", pid)
-			return
+			fmt.Printf("yiduo sync daemon already running (pid %d), restarting to use latest binary\n", pid)
+			if err := stopDaemon(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to stop daemon: %v\n", err)
+				os.Exit(1)
+			}
+			if err := waitForDaemonStop(5 * time.Second); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to restart daemon: %v\n", err)
+				os.Exit(1)
+			}
 		}
 		if err := spawnDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to start daemon: %v\n", err)
@@ -3108,8 +3115,17 @@ func loadCursorSessions(root string, logf func(format string, args ...any)) ([]S
 		logCursorf(logf, "cursor: chat error: %v", err)
 		chatSessions = nil
 	}
-	logCursorf(logf, "cursor: tracking sessions=%d chat sessions=%d", len(trackingSessions), len(chatSessions))
-	return append(trackingSessions, chatSessions...), nil
+	transcriptSessions, err := loadCursorTranscriptSessions(root, logf)
+	if err != nil {
+		logCursorf(logf, "cursor: transcript error: %v", err)
+		transcriptSessions = nil
+	}
+	logCursorf(logf, "cursor: tracking sessions=%d chat sessions=%d transcript sessions=%d", len(trackingSessions), len(chatSessions), len(transcriptSessions))
+	all := make([]SyncSession, 0, len(trackingSessions)+len(chatSessions)+len(transcriptSessions))
+	all = append(all, trackingSessions...)
+	all = append(all, chatSessions...)
+	all = append(all, transcriptSessions...)
+	return all, nil
 }
 
 func logCursorf(logf func(format string, args ...any), format string, args ...any) {
@@ -3260,6 +3276,156 @@ func loadCursorChatSessions(root string, logf func(format string, args ...any)) 
 	}
 	logCursorf(logf, "cursor: chat parsed sessions=%d", len(sessions))
 	return sessions, nil
+}
+
+func loadCursorTranscriptSessions(root string, logf func(format string, args ...any)) ([]SyncSession, error) {
+	projectsRoot := filepath.Join(root, "projects")
+	info, err := os.Stat(projectsRoot)
+	if err != nil || !info.IsDir() {
+		logCursorf(logf, "cursor: projects dir missing at %s", projectsRoot)
+		return []SyncSession{}, nil
+	}
+
+	transcriptPaths := make([]string, 0)
+	err = filepath.WalkDir(projectsRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".txt") {
+			return nil
+		}
+		if !strings.Contains(filepath.ToSlash(path), "/agent-transcripts/") {
+			return nil
+		}
+		transcriptPaths = append(transcriptPaths, path)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(transcriptPaths)
+	logCursorf(logf, "cursor: transcript files found=%d", len(transcriptPaths))
+
+	sessions := make([]SyncSession, 0, len(transcriptPaths))
+	for _, path := range transcriptPaths {
+		session, ok := parseCursorTranscript(path, projectsRoot)
+		if ok {
+			sessions = append(sessions, session)
+		}
+	}
+	logCursorf(logf, "cursor: transcript parsed sessions=%d", len(sessions))
+	return sessions, nil
+}
+
+func parseCursorTranscript(path string, projectsRoot string) (SyncSession, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+
+	sessionID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if sessionID == "" {
+		return SyncSession{}, false
+	}
+
+	endedAt := ""
+	if stat, err := os.Stat(path); err == nil {
+		endedAt = stat.ModTime().UTC().Format(time.RFC3339)
+	}
+
+	session := SyncSession{
+		ID:        "cursor-transcript:" + sessionID,
+		Title:     "",
+		Cwd:       normalizeCwd(extractCursorProjectPath(path, projectsRoot)),
+		StartedAt: endedAt,
+		EndedAt:   endedAt,
+	}
+
+	currentRole := ""
+	current := make([]string, 0, 64)
+	msgIndex := 0
+	flush := func() {
+		if currentRole == "" || len(current) == 0 {
+			current = current[:0]
+			return
+		}
+		content := cleanCursorTranscriptContent(strings.TrimSpace(strings.Join(current, "\n")))
+		current = current[:0]
+		if content == "" {
+			return
+		}
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:   msgIndex,
+			Role:    currentRole,
+			Content: content,
+		})
+		if session.Title == "" && currentRole == "user" {
+			session.Title = content
+		}
+		msgIndex++
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch trimmed {
+		case "user:":
+			flush()
+			currentRole = "user"
+			continue
+		case "assistant:":
+			flush()
+			currentRole = "assistant"
+			continue
+		}
+		if currentRole == "" {
+			continue
+		}
+		current = append(current, line)
+	}
+	flush()
+
+	if len(session.Messages) == 0 {
+		return SyncSession{}, false
+	}
+	if session.Title == "" {
+		if session.Cwd != "" {
+			session.Title = session.Cwd
+		} else {
+			session.Title = "Cursor transcript"
+		}
+	}
+	return session, true
+}
+
+func cleanCursorTranscriptContent(value string) string {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return ""
+	}
+	if extracted := extractTaggedValue(v, "user_query"); extracted != "" {
+		return strings.TrimSpace(extracted)
+	}
+	v = strings.ReplaceAll(v, "<user_query>", "")
+	v = strings.ReplaceAll(v, "</user_query>", "")
+	return strings.TrimSpace(v)
+}
+
+func extractCursorProjectPath(transcriptPath string, projectsRoot string) string {
+	rel, err := filepath.Rel(projectsRoot, transcriptPath)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) < 3 {
+		return ""
+	}
+	projectKey := strings.TrimSpace(parts[0])
+	if projectKey == "" {
+		return ""
+	}
+	return "/" + strings.ReplaceAll(projectKey, "-", "/")
 }
 
 func parseCursorChatStore(dbPath string, logf func(format string, args ...any)) (SyncSession, bool) {
