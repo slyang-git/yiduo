@@ -654,6 +654,7 @@ func printDaemonStatus() {
 	fmt.Printf("🔖 Version: %s\n", version)
 	fmt.Printf("📦 Install path: %s\n", executablePath())
 	fmt.Printf("⚙️  Config path: %s\n", configPath())
+	fmt.Printf("🔄 Last sync: %s\n", lastSyncTimeDisplay())
 	if running, pid := daemonRunning(); running {
 		fmt.Printf("🟢 Daemon: running (pid %d)\n", pid)
 		if startedAt, ok := daemonStartedAt(pid); ok {
@@ -843,6 +844,53 @@ func executablePath() string {
 		return resolved
 	}
 	return path
+}
+
+func lastSyncTimeDisplay() string {
+	path := daemonLogPath()
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return "-"
+	}
+
+	const maxScanBytes int64 = 1 << 20
+	start := int64(0)
+	if info.Size() > maxScanBytes {
+		start = info.Size() - maxScanBytes
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return "-"
+	}
+	defer file.Close()
+
+	buf := make([]byte, info.Size()-start)
+	if _, err := file.ReadAt(buf, start); err != nil && err != io.EOF {
+		return "-"
+	}
+	if start > 0 {
+		if idx := bytes.IndexByte(buf, '\n'); idx >= 0 && idx+1 < len(buf) {
+			buf = buf[idx+1:]
+		}
+	}
+
+	lines := strings.Split(string(buf), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || !strings.Contains(line, " sync complete:") {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) < 1 {
+			continue
+		}
+		ts := strings.TrimSpace(parts[0])
+		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+			return formatStatusTime(parsed)
+		}
+	}
+	return "-"
 }
 func daemonLogPath() string {
 	return filepath.Join(expandUser("~/.yiduo"), "sync.log")
