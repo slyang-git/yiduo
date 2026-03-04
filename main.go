@@ -1213,41 +1213,114 @@ func loadClaudeSessions(root string) ([]SyncSession, error) {
 		return nil, err
 	}
 
-	var sessions []SyncSession
+	entryByPath := map[string]claudeEntry{}
+	sessionFiles := make([]string, 0)
+	seen := map[string]bool{}
+
+	// Primary source: sessions-index metadata when present.
 	for _, indexPath := range indexPaths {
 		items, err := parseClaudeIndex(indexPath)
 		if err != nil {
 			continue
 		}
 		for _, entry := range items {
-			if entry.SessionID == "" || entry.FullPath == "" {
+			fullPath := strings.TrimSpace(entry.FullPath)
+			if fullPath == "" {
 				continue
 			}
-			if isClaudeIndexProbe(entry) {
-				continue
+			entryByPath[fullPath] = entry
+			if !seen[fullPath] {
+				seen[fullPath] = true
+				sessionFiles = append(sessionFiles, fullPath)
 			}
-			session := SyncSession{
-				ID:        entry.SessionID,
-				Title:     entry.FirstPrompt,
-				Cwd:       entry.ProjectPath,
-				StartedAt: entry.Created,
-				EndedAt:   entry.Modified,
-			}
-			ok, skip := parseClaudeSession(entry.FullPath, &session)
-			if !ok || skip {
-				continue
-			}
-			if session.TotalTokens == 0 && session.Model == "" {
-				title := strings.ToLower(strings.TrimSpace(session.Title))
-				if title == "what is 2+2?" || len(session.Messages) <= 2 {
-					continue
-				}
-			}
-			sessions = append(sessions, session)
 		}
 	}
 
+	// Compatibility: newer Claude formats can create JSONL files that are not indexed yet.
+	fallbackJSONL, err := listJSONL(projectsDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range fallbackJSONL {
+		if !seen[path] {
+			seen[path] = true
+			sessionFiles = append(sessionFiles, path)
+		}
+	}
+	sort.Strings(sessionFiles)
+
+	var sessions []SyncSession
+	for _, path := range sessionFiles {
+		entry := entryByPath[path]
+		if isClaudeIndexProbe(entry) {
+			continue
+		}
+		session := SyncSession{
+			ID:        entry.SessionID,
+			Title:     entry.FirstPrompt,
+			Cwd:       entry.ProjectPath,
+			StartedAt: entry.Created,
+			EndedAt:   entry.Modified,
+		}
+		if session.ID == "" {
+			session.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+		}
+		if session.Cwd == "" {
+			session.Cwd = normalizeCwd(extractClaudeProjectPath(path, projectsDir))
+		}
+		ok, skip := parseClaudeSession(path, &session)
+		if !ok || skip {
+			continue
+		}
+		session.Cwd = normalizeCwd(session.Cwd)
+		if session.StartedAt == "" {
+			session.StartedAt = session.EndedAt
+		}
+		if session.EndedAt == "" {
+			session.EndedAt = session.StartedAt
+		}
+		if session.Title == "" {
+			if session.Cwd != "" {
+				session.Title = session.Cwd
+			} else {
+				session.Title = "Claude session"
+			}
+		}
+		if session.TotalTokens == 0 {
+			session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens + session.TotalReasoningTokens
+		}
+		if session.TotalTokens == 0 && session.Model == "" {
+			title := strings.ToLower(strings.TrimSpace(session.Title))
+			if title == "what is 2+2?" || len(session.Messages) <= 2 {
+				continue
+			}
+		}
+		sessions = append(sessions, session)
+	}
+
 	return sessions, nil
+}
+
+func extractClaudeProjectPath(filePath string, projectsDir string) string {
+	rel, err := filepath.Rel(projectsDir, filePath)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	projectKey := strings.TrimSpace(parts[0])
+	if projectKey == "" || projectKey == "-" {
+		return ""
+	}
+	if strings.HasPrefix(projectKey, "-") {
+		projectKey = strings.TrimPrefix(projectKey, "-")
+	}
+	if projectKey == "" {
+		return ""
+	}
+	return "/" + strings.ReplaceAll(projectKey, "-", "/")
 }
 
 func isClaudeIndexProbe(entry claudeEntry) bool {
@@ -1284,11 +1357,18 @@ func parseClaudeIndex(path string) ([]claudeEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var idx claudeIndex
-	if err := json.Unmarshal(raw, &idx); err != nil {
+	if err := json.Unmarshal(raw, &idx); err == nil && len(idx.Entries) > 0 {
+		return idx.Entries, nil
+	}
+
+	// Compatibility: some versions persist top-level arrays instead of {entries:[...]}.
+	var entries []claudeEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
 		return nil, err
 	}
-	return idx.Entries, nil
+	return entries, nil
 }
 
 func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
@@ -1314,6 +1394,21 @@ func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
 		dec.UseNumber()
 		if err := dec.Decode(&item); err != nil {
 			continue
+		}
+
+		if session.ID == "" {
+			session.ID = strings.TrimSpace(stringFrom(item["sessionId"]))
+		}
+		if session.Cwd == "" {
+			session.Cwd = normalizeCwd(stringFrom(item["cwd"]))
+		}
+		if ts := strings.TrimSpace(stringFrom(item["timestamp"])); ts != "" {
+			if session.StartedAt == "" || ts < session.StartedAt {
+				session.StartedAt = ts
+			}
+			if session.EndedAt == "" || ts > session.EndedAt {
+				session.EndedAt = ts
+			}
 		}
 
 		typeValue := stringFrom(item["type"])
@@ -1348,6 +1443,9 @@ func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
 		msgIndex++
 		if typeValue == "user" {
 			userMessages++
+			if session.Title == "" {
+				session.Title = content
+			}
 		} else {
 			assistantMessages++
 		}
@@ -1360,7 +1458,9 @@ func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
 			usage := mapFrom(message["usage"])
 			inputTokens := intFrom(usage["input_tokens"], 0)
 			outputTokens := intFrom(usage["output_tokens"], 0)
-			cachedInputTokens := intFrom(usage["cache_read_input_tokens"], 0)
+			cachedReadTokens := intFrom(usage["cache_read_input_tokens"], 0)
+			cachedCreateTokens := intFrom(usage["cache_creation_input_tokens"], 0)
+			cachedInputTokens := cachedReadTokens + cachedCreateTokens
 			reasoningTokens := intFrom(usage["reasoning_output_tokens"], 0)
 			msg.InputTokens = inputTokens
 			msg.OutputTokens = outputTokens
@@ -1371,7 +1471,7 @@ func parseClaudeSession(filePath string, session *SyncSession) (bool, bool) {
 			session.TotalOutputTokens += outputTokens
 			session.TotalCachedInputTokens += cachedInputTokens
 			session.TotalReasoningTokens += reasoningTokens
-			session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
+			session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens + session.TotalReasoningTokens
 		}
 		session.Messages = append(session.Messages, msg)
 	}
