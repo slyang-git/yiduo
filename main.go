@@ -136,7 +136,7 @@ func main() {
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
-	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid (comma-separated)")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder (comma-separated)")
 	authToken := flag.String("auth-token", "", "auth token for sync authentication")
 	deviceToken := flag.String("device-token", "", "deprecated: use --auth-token")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
@@ -156,6 +156,7 @@ func main() {
 	crushRoot := flag.String("crush-root", envOrDefault("CRUSH_ROOT", "~/.crush"), "Crush root")
 	antigravityRoot := flag.String("antigravity-root", envOrDefault("ANTIGRAVITY_ROOT", "~/.gemini/antigravity"), "Antigravity root")
 	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
+	qoderRoot := flag.String("qoder-root", envOrDefault("QODER_ROOT", "~/.qoder"), "Qoder root")
 	agentID := flag.String("agent-id", "local", "agent id")
 	host := flag.String("host", hostname(), "host name")
 	if err := flag.CommandLine.Parse(args); err != nil {
@@ -336,6 +337,7 @@ func main() {
 			crushRoot:       expandUser(*crushRoot),
 			antigravityRoot: expandUser(*antigravityRoot),
 			droidRoot:       expandUser(*droidRoot),
+			qoderRoot:       expandUser(*qoderRoot),
 			logf:            options.logf,
 		}, options)
 	}
@@ -403,7 +405,7 @@ Sync Subcommands:
 
 Key Flags:
   --source string        Data source(s), comma-separated.
-                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid
+                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder
   --daemon, -d           Run sync daemon in background
   --server string        API server base URL
   --auth-token string    Sync auth token
@@ -414,7 +416,7 @@ Key Flags:
 Root Path Flags:
   --codex-root --claude-root --gemini-root --qwen-root --cline-root --continue-root
   --kilocode-root --cursor-root --amp-root --opencode-root --pi-root --openclaw-root --crush-root
-  --antigravity-root --droid-root
+  --antigravity-root --droid-root --qoder-root
 
 Examples:
   %s status
@@ -448,6 +450,7 @@ type syncParams struct {
 	crushRoot       string
 	antigravityRoot string
 	droidRoot       string
+	qoderRoot       string
 	logf            func(format string, args ...any)
 }
 
@@ -493,6 +496,8 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			sessions, err = loadAntigravitySessions(params.antigravityRoot)
 		case "droid":
 			sessions, err = loadDroidSessions(params.droidRoot)
+		case "qoder":
+			sessions, err = loadQoderSessions(params.qoderRoot)
 		default:
 			return 0, fmt.Errorf("unknown source: %s", sourceName)
 		}
@@ -5136,6 +5141,204 @@ func parseDroidSession(path string) (SyncSession, bool) {
 	return session, session.ID != ""
 }
 
+type qoderSessionMeta struct {
+	ID                   string `json:"id"`
+	Title                string `json:"title"`
+	WorkingDir           string `json:"working_dir"`
+	CreatedAt            int64  `json:"created_at"`
+	UpdatedAt            int64  `json:"updated_at"`
+	TotalPromptTokens    int    `json:"total_prompt_tokens"`
+	TotalCompletedTokens int    `json:"total_completed_tokens"`
+	TotalCachedTokens    int    `json:"total_cached_tokens"`
+}
+
+func loadQoderSessions(root string) ([]SyncSession, error) {
+	projectsDir := filepath.Join(root, "projects")
+	info, err := os.Stat(projectsDir)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	var sessions []SyncSession
+	err = filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		session, ok := parseQoderSession(path)
+		if ok {
+			sessions = append(sessions, session)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sessions, nil
+}
+
+func parseQoderSession(path string) (SyncSession, bool) {
+	var meta qoderSessionMeta
+	metaPath := strings.TrimSuffix(path, ".jsonl") + "-session.json"
+	if raw, err := os.ReadFile(metaPath); err == nil {
+		_ = json.Unmarshal(raw, &meta)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	defer file.Close()
+
+	sessionID := strings.TrimSpace(meta.ID)
+	if sessionID == "" {
+		sessionID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	}
+
+	session := SyncSession{
+		ID:    sessionID,
+		Title: strings.TrimSpace(meta.Title),
+		Cwd:   normalizeCwd(meta.WorkingDir),
+	}
+	if meta.CreatedAt > 0 {
+		session.StartedAt = formatMillis(meta.CreatedAt)
+	}
+	if meta.UpdatedAt > 0 {
+		session.EndedAt = formatMillis(meta.UpdatedAt)
+	}
+
+	var startedAt time.Time
+	var endedAt time.Time
+	msgIndex := 0
+	totalInputTokens := 0
+	totalOutputTokens := 0
+	totalCachedTokens := 0
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			continue
+		}
+		if boolFrom(item["isMeta"]) {
+			continue
+		}
+
+		if session.Cwd == "" {
+			session.Cwd = normalizeCwd(stringFrom(item["cwd"]))
+		}
+		if session.ID == "" {
+			session.ID = strings.TrimSpace(stringFrom(item["sessionId"]))
+		}
+
+		timestamp := strings.TrimSpace(stringFrom(item["timestamp"]))
+		if timestamp != "" {
+			if ts, err := time.Parse(time.RFC3339, timestamp); err == nil {
+				if startedAt.IsZero() || ts.Before(startedAt) {
+					startedAt = ts
+				}
+				if endedAt.IsZero() || ts.After(endedAt) {
+					endedAt = ts
+				}
+			}
+		}
+
+		messageObj := mapFrom(item["message"])
+		role := strings.TrimSpace(stringFrom(messageObj["role"]))
+		if role == "" {
+			role = strings.TrimSpace(stringFrom(item["type"]))
+		}
+		if role == "" {
+			role = "assistant"
+		}
+		content := parseQoderContent(messageObj["content"])
+		if content == "" {
+			continue
+		}
+
+		usage := mapFrom(messageObj["usage"])
+		inputTokens := intFrom(usage["input_tokens"], 0)
+		outputTokens := intFrom(usage["output_tokens"], 0)
+		cachedTokens := intFrom(usage["cache_read_input_tokens"], 0) + intFrom(usage["cache_creation_input_tokens"], 0)
+		totalTokens := inputTokens + outputTokens + cachedTokens
+
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:             msgIndex,
+			Role:              role,
+			Content:           content,
+			Timestamp:         timestamp,
+			InputTokens:       inputTokens,
+			OutputTokens:      outputTokens,
+			CachedInputTokens: cachedTokens,
+			TotalTokens:       totalTokens,
+		})
+		msgIndex++
+		if session.Title == "" && role == "user" {
+			session.Title = firstLine(content)
+		}
+		totalInputTokens += inputTokens
+		totalOutputTokens += outputTokens
+		totalCachedTokens += cachedTokens
+	}
+
+	if session.ID == "" {
+		session.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	}
+	if session.Title == "" {
+		session.Title = "Qoder session"
+	}
+
+	if session.StartedAt == "" && !startedAt.IsZero() {
+		session.StartedAt = startedAt.Format(time.RFC3339)
+	}
+	if session.EndedAt == "" && !endedAt.IsZero() {
+		session.EndedAt = endedAt.Format(time.RFC3339)
+	}
+	if session.StartedAt == "" {
+		if stat, err := os.Stat(path); err == nil {
+			session.StartedAt = stat.ModTime().Format(time.RFC3339)
+			session.EndedAt = session.StartedAt
+		}
+	}
+
+	if meta.TotalPromptTokens > 0 || meta.TotalCompletedTokens > 0 || meta.TotalCachedTokens > 0 {
+		session.TotalInputTokens = meta.TotalPromptTokens
+		session.TotalOutputTokens = meta.TotalCompletedTokens
+		session.TotalCachedInputTokens = meta.TotalCachedTokens
+	} else {
+		session.TotalInputTokens = totalInputTokens
+		session.TotalOutputTokens = totalOutputTokens
+		session.TotalCachedInputTokens = totalCachedTokens
+	}
+	session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens
+
+	if len(session.Messages) == 0 {
+		return SyncSession{}, false
+	}
+
+	return session, session.ID != ""
+}
+
+func parseQoderContent(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		return parseMessageContent(v)
+	default:
+		return ""
+	}
+}
+
 func parseClaudeContent(value any) string {
 	switch v := value.(type) {
 	case string:
@@ -5537,6 +5740,28 @@ func stringFrom(value any) string {
 	}
 }
 
+func boolFrom(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
+}
+
+func firstLine(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(trimmed, '\n'); idx >= 0 {
+		return strings.TrimSpace(trimmed[:idx])
+	}
+	return trimmed
+}
+
 func mapFrom(value any) map[string]any {
 	if value == nil {
 		return map[string]any{}
@@ -5639,6 +5864,7 @@ func parseSources(value string) ([]string, error) {
 			"crush",
 			"antigravity",
 			"droid",
+			"qoder",
 		}, nil
 	}
 	parts := strings.Split(normalized, ",")
@@ -5658,6 +5884,7 @@ func parseSources(value string) ([]string, error) {
 		"crush":       true,
 		"antigravity": true,
 		"droid":       true,
+		"qoder":       true,
 	}
 	seen := map[string]bool{}
 	var sources []string
@@ -5683,6 +5910,7 @@ func parseSources(value string) ([]string, error) {
 				"crush",
 				"antigravity",
 				"droid",
+				"qoder",
 			}, nil
 		}
 		if !allowed[source] {
@@ -5731,6 +5959,8 @@ func defaultToolName(source string) string {
 		return "antigravity"
 	case "droid":
 		return "droid"
+	case "qoder":
+		return "qoder"
 	default:
 		return source
 	}
