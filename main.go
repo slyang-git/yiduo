@@ -1226,9 +1226,10 @@ func parseCodexSession(filePath string) (SyncSession, bool) {
 			}
 			content := parseMessageContent(payload["content"])
 			if content != "" {
+				role := normalizeStructuredMessageRole(stringFrom(payload["role"]), payload["content"])
 				session.Messages = append(session.Messages, SyncMessage{
 					Index:   msgIndex,
-					Role:    stringFrom(payload["role"]),
+					Role:    role,
 					Content: content,
 				})
 				msgIndex++
@@ -3849,10 +3850,7 @@ func parseAmpThread(path string) (SyncSession, bool) {
 	msgIndex := 0
 	for _, item := range entries {
 		msg := mapFrom(item)
-		role := strings.TrimSpace(stringFrom(msg["role"]))
-		if role == "" {
-			continue
-		}
+		role := normalizeStructuredMessageRole(stringFrom(msg["role"]), msg["content"])
 
 		tsMs := int64From(mapFrom(msg["meta"])["sentAt"], 0)
 		if tsMs > 0 {
@@ -5070,10 +5068,7 @@ func parseDroidSession(path string) (SyncSession, bool) {
 			if content == "" {
 				continue
 			}
-			role := message.Role
-			if role == "" {
-				role = "user"
-			}
+			role := normalizeStructuredMessageRole(message.Role, message.Content)
 			timestamp := stringFrom(item["timestamp"])
 			session.Messages = append(session.Messages, SyncMessage{
 				Index:     msgIndex,
@@ -5253,13 +5248,7 @@ func parseQoderSession(path string) (SyncSession, bool) {
 		}
 
 		messageObj := mapFrom(item["message"])
-		role := strings.TrimSpace(stringFrom(messageObj["role"]))
-		if role == "" {
-			role = strings.TrimSpace(stringFrom(item["type"]))
-		}
-		if role == "" {
-			role = "assistant"
-		}
+		role := resolveQoderRole(item, messageObj)
 		content := parseQoderContent(messageObj["content"])
 		if content == "" {
 			continue
@@ -5337,6 +5326,59 @@ func parseQoderContent(value any) string {
 	default:
 		return ""
 	}
+}
+
+func resolveQoderRole(item map[string]any, messageObj map[string]any) string {
+	role := strings.ToLower(strings.TrimSpace(stringFrom(messageObj["role"])))
+	if role == "" {
+		role = strings.ToLower(strings.TrimSpace(stringFrom(item["type"])))
+	}
+	return normalizeStructuredMessageRole(role, messageObj["content"])
+}
+
+func normalizeStructuredMessageRole(role string, content any) string {
+	normalizedRole := strings.ToLower(strings.TrimSpace(role))
+	hasText, hasToolUse, hasToolResult := structuredContentFlags(content)
+	// Some tools encode tool events as user role; force these to assistant-side turns.
+	if hasToolResult && !hasText && !hasToolUse {
+		return "assistant"
+	}
+	if hasToolUse {
+		return "assistant"
+	}
+	switch normalizedRole {
+	case "user", "assistant", "system", "tool":
+		return normalizedRole
+	case "":
+		return "assistant"
+	default:
+		return normalizedRole
+	}
+}
+
+func structuredContentFlags(value any) (hasText bool, hasToolUse bool, hasToolResult bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return false, false, false
+	}
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		entryType := strings.ToLower(strings.TrimSpace(stringFrom(entry["type"])))
+		switch entryType {
+		case "text":
+			if strings.TrimSpace(stringFrom(entry["text"])) != "" {
+				hasText = true
+			}
+		case "tool_use":
+			hasToolUse = true
+		case "tool_result":
+			hasToolResult = true
+		}
+	}
+	return hasText, hasToolUse, hasToolResult
 }
 
 func parseClaudeContent(value any) string {
