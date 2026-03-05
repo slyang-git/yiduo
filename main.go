@@ -421,6 +421,7 @@ type syncParams struct {
 
 func syncOnce(params syncParams, options syncOptions) (int, error) {
 	totalSessions := 0
+	sentPayload := false
 	for _, sourceName := range params.sources {
 		toolName := defaultToolName(sourceName)
 		if params.toolOverride != "" {
@@ -500,6 +501,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 		if err := syncPayload(params.server, params.deviceToken, payload); err != nil {
 			return 0, fmt.Errorf("sync failed for %s: %v", sourceName, err)
 		}
+		sentPayload = true
 
 		totalSessions += len(sessions)
 		if options.incremental && options.state != nil && !maxUpdated.IsZero() {
@@ -507,6 +509,18 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 				options.state.LastSync = map[string]string{}
 			}
 			options.state.LastSync[sourceName] = maxUpdated.UTC().Format(time.RFC3339)
+		}
+	}
+	if options.incremental && !sentPayload {
+		heartbeat := SyncPayload{
+			AgentID:  params.agentID,
+			Tool:     "heartbeat",
+			Host:     params.host,
+			Device:   params.deviceInfo,
+			Sessions: []SyncSession{},
+		}
+		if err := syncPayload(params.server, params.deviceToken, heartbeat); err != nil {
+			return 0, fmt.Errorf("sync failed for heartbeat: %v", err)
 		}
 	}
 	return totalSessions, nil
