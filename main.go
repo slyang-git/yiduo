@@ -31,10 +31,14 @@ type SyncPayload struct {
 }
 
 type DeviceInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	OS   string `json:"os"`
-	Arch string `json:"arch"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	OS           string `json:"os"`
+	OSVersion    string `json:"os_version,omitempty"`
+	Arch         string `json:"arch"`
+	CPUModel     string `json:"cpu_model,omitempty"`
+	CPUCores     int    `json:"cpu_cores,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
 }
 
 type SyncSession struct {
@@ -251,11 +255,16 @@ func main() {
 	}
 	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "https://yiduo.one/")
 	resolvedDeviceToken := firstNonEmpty(*authToken, *deviceToken, os.Getenv("AI_WRAPPED_SYNC_TOKEN"), os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.AuthToken, config.LegacyDeviceToken)
+	osVersion, cpuModel := detectMachineDetails()
 	deviceInfo := DeviceInfo{
-		ID:   config.DeviceID,
-		Name: *host,
-		OS:   runtime.GOOS,
-		Arch: runtime.GOARCH,
+		ID:           config.DeviceID,
+		Name:         *host,
+		OS:           runtime.GOOS,
+		OSVersion:    osVersion,
+		Arch:         runtime.GOARCH,
+		CPUModel:     cpuModel,
+		CPUCores:     runtime.NumCPU(),
+		AgentVersion: version,
 	}
 
 	sources, err := parseSources(*source)
@@ -5279,6 +5288,76 @@ func hostname() string {
 		return "unknown"
 	}
 	return name
+}
+
+func detectMachineDetails() (string, string) {
+	osVersion := detectOSVersion()
+	cpuModel := detectCPUModel()
+	return osVersion, cpuModel
+}
+
+func detectOSVersion() string {
+	switch runtime.GOOS {
+	case "linux":
+		if raw, err := os.ReadFile("/etc/os-release"); err == nil {
+			for _, line := range strings.Split(string(raw), "\n") {
+				if strings.HasPrefix(line, "PRETTY_NAME=") {
+					value := strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), "\"")
+					if strings.TrimSpace(value) != "" {
+						return value
+					}
+				}
+			}
+		}
+	case "darwin":
+		if out, err := exec.Command("sw_vers", "-productVersion").Output(); err == nil {
+			value := strings.TrimSpace(string(out))
+			if value != "" {
+				return "macOS " + value
+			}
+		}
+	}
+	if out, err := exec.Command("uname", "-r").Output(); err == nil {
+		value := strings.TrimSpace(string(out))
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func detectCPUModel() string {
+	switch runtime.GOOS {
+	case "linux":
+		if raw, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+			for _, line := range strings.Split(string(raw), "\n") {
+				lower := strings.ToLower(line)
+				if strings.HasPrefix(lower, "model name") || strings.HasPrefix(lower, "hardware") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						value := strings.TrimSpace(parts[1])
+						if value != "" {
+							return value
+						}
+					}
+				}
+			}
+		}
+	case "darwin":
+		if out, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output(); err == nil {
+			value := strings.TrimSpace(string(out))
+			if value != "" {
+				return value
+			}
+		}
+	}
+	if out, err := exec.Command("uname", "-m").Output(); err == nil {
+		value := strings.TrimSpace(string(out))
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 type yiduoConfig struct {
