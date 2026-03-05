@@ -31,14 +31,22 @@ type SyncPayload struct {
 }
 
 type DeviceInfo struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	OS           string `json:"os"`
-	OSVersion    string `json:"os_version,omitempty"`
-	Arch         string `json:"arch"`
-	CPUModel     string `json:"cpu_model,omitempty"`
-	CPUCores     int    `json:"cpu_cores,omitempty"`
-	AgentVersion string `json:"agent_version,omitempty"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	OS                string   `json:"os"`
+	OSVersion         string   `json:"os_version,omitempty"`
+	KernelVersion     string   `json:"kernel_version,omitempty"`
+	Timezone          string   `json:"timezone,omitempty"`
+	Arch              string   `json:"arch"`
+	CPUModel          string   `json:"cpu_model,omitempty"`
+	CPUCores          int      `json:"cpu_cores,omitempty"`
+	MemoryTotalMB     int      `json:"memory_total_mb,omitempty"`
+	DiskFreeGB        int      `json:"disk_free_gb,omitempty"`
+	AgentVersion      string   `json:"agent_version,omitempty"`
+	DaemonStartedAt   string   `json:"daemon_started_at,omitempty"`
+	LastSyncAttemptAt string   `json:"last_sync_attempt_at,omitempty"`
+	LastSyncOKAt      string   `json:"last_sync_ok_at,omitempty"`
+	SourcesEnabled    []string `json:"sources_enabled,omitempty"`
 }
 
 type SyncSession struct {
@@ -256,15 +264,24 @@ func main() {
 	resolvedServer := firstNonEmpty(*server, os.Getenv("AI_WRAPPED_SERVER"), config.Server, "https://yiduo.one/")
 	resolvedDeviceToken := firstNonEmpty(*authToken, *deviceToken, os.Getenv("AI_WRAPPED_SYNC_TOKEN"), os.Getenv("AI_WRAPPED_DEVICE_TOKEN"), config.AuthToken, config.LegacyDeviceToken)
 	osVersion, cpuModel := detectMachineDetails()
-	deviceInfo := DeviceInfo{
-		ID:           config.DeviceID,
-		Name:         *host,
-		OS:           runtime.GOOS,
-		OSVersion:    osVersion,
-		Arch:         runtime.GOARCH,
-		CPUModel:     cpuModel,
-		CPUCores:     runtime.NumCPU(),
-		AgentVersion: version,
+	homeDir, _ := os.UserHomeDir()
+	baseDeviceInfo := DeviceInfo{
+		ID:            config.DeviceID,
+		Name:          *host,
+		OS:            runtime.GOOS,
+		OSVersion:     osVersion,
+		KernelVersion: detectKernelVersion(),
+		Timezone:      time.Now().Location().String(),
+		Arch:          runtime.GOARCH,
+		CPUModel:      cpuModel,
+		CPUCores:      runtime.NumCPU(),
+		MemoryTotalMB: detectMemoryTotalMB(),
+		DiskFreeGB:    detectDiskFreeGB(homeDir),
+		AgentVersion:  version,
+	}
+	daemonStartedAt := ""
+	if daemonWorker {
+		daemonStartedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 
 	sources, err := parseSources(*source)
@@ -272,6 +289,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid source: %v\n", err)
 		os.Exit(1)
 	}
+	baseDeviceInfo.SourcesEnabled = append([]string(nil), sources...)
 
 	toolOverride := strings.TrimSpace(*tool)
 	if toolOverride != "" && len(sources) > 1 {
@@ -290,6 +308,11 @@ func main() {
 		if options.logf != nil {
 			options.logf("yiduo sync start")
 		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		deviceInfo := baseDeviceInfo
+		deviceInfo.LastSyncAttemptAt = now
+		deviceInfo.LastSyncOKAt = now
+		deviceInfo.DaemonStartedAt = daemonStartedAt
 		return syncOnce(syncParams{
 			server:          resolvedServer,
 			deviceToken:     resolvedDeviceToken,
@@ -5296,6 +5319,16 @@ func detectMachineDetails() (string, string) {
 	return osVersion, cpuModel
 }
 
+func detectKernelVersion() string {
+	if out, err := exec.Command("uname", "-r").Output(); err == nil {
+		value := strings.TrimSpace(string(out))
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func detectOSVersion() string {
 	switch runtime.GOOS {
 	case "linux":
@@ -5358,6 +5391,50 @@ func detectCPUModel() string {
 		}
 	}
 	return ""
+}
+
+func detectMemoryTotalMB() int {
+	if runtime.GOOS == "linux" {
+		if raw, err := os.ReadFile("/proc/meminfo"); err == nil {
+			for _, line := range strings.Split(string(raw), "\n") {
+				if !strings.HasPrefix(line, "MemTotal:") {
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) < 2 {
+					break
+				}
+				if kb, err := strconv.Atoi(fields[1]); err == nil && kb > 0 {
+					return kb / 1024
+				}
+				break
+			}
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if out, err := exec.Command("sysctl", "-n", "hw.memsize").Output(); err == nil {
+			value := strings.TrimSpace(string(out))
+			if bytes, err := strconv.ParseInt(value, 10, 64); err == nil && bytes > 0 {
+				return int(bytes / 1024 / 1024)
+			}
+		}
+	}
+	return 0
+}
+
+func detectDiskFreeGB(path string) int {
+	if strings.TrimSpace(path) == "" {
+		path = "."
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0
+	}
+	freeBytes := stat.Bavail * uint64(stat.Bsize)
+	if freeBytes == 0 {
+		return 0
+	}
+	return int(freeBytes / 1024 / 1024 / 1024)
 }
 
 type yiduoConfig struct {
