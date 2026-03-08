@@ -290,7 +290,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid source: %v\n", err)
 		os.Exit(1)
 	}
-	baseDeviceInfo.SourcesEnabled = append([]string(nil), sources...)
 
 	toolOverride := strings.TrimSpace(*tool)
 	if toolOverride != "" && len(sources) > 1 {
@@ -305,6 +304,33 @@ func main() {
 		options.state = &state
 	}
 
+	baseParams := syncParams{
+		server:          resolvedServer,
+		deviceToken:     resolvedDeviceToken,
+		agentID:         *agentID,
+		host:            *host,
+		toolOverride:    toolOverride,
+		sources:         sources,
+		codexRoot:       expandUser(*codexRoot),
+		claudeRoot:      expandUser(*claudeRoot),
+		geminiRoot:      expandUser(*geminiRoot),
+		qwenRoot:        expandUser(*qwenRoot),
+		clineRoot:       expandUser(*clineRoot),
+		continueRoot:    expandUser(*continueRoot),
+		kiloRoot:        expandUser(*kiloRoot),
+		cursorRoot:      expandUser(*cursorRoot),
+		ampRoot:         expandUser(*ampRoot),
+		opencodeRoot:    expandUser(*opencodeRoot),
+		piRoot:          expandUser(*piRoot),
+		openclawRoot:    expandUser(*openclawRoot),
+		crushRoot:       expandUser(*crushRoot),
+		antigravityRoot: expandUser(*antigravityRoot),
+		droidRoot:       expandUser(*droidRoot),
+		qoderRoot:       expandUser(*qoderRoot),
+		logf:            options.logf,
+	}
+	baseDeviceInfo.SourcesEnabled = detectInstalledSources(baseParams)
+
 	runOnce := func() (int, error) {
 		if options.logf != nil {
 			options.logf("yiduo sync start")
@@ -314,32 +340,10 @@ func main() {
 		deviceInfo.LastSyncAttemptAt = now
 		deviceInfo.LastSyncOKAt = now
 		deviceInfo.DaemonStartedAt = daemonStartedAt
-		return syncOnce(syncParams{
-			server:          resolvedServer,
-			deviceToken:     resolvedDeviceToken,
-			deviceInfo:      deviceInfo,
-			agentID:         *agentID,
-			host:            *host,
-			toolOverride:    toolOverride,
-			sources:         sources,
-			codexRoot:       expandUser(*codexRoot),
-			claudeRoot:      expandUser(*claudeRoot),
-			geminiRoot:      expandUser(*geminiRoot),
-			qwenRoot:        expandUser(*qwenRoot),
-			clineRoot:       expandUser(*clineRoot),
-			continueRoot:    expandUser(*continueRoot),
-			kiloRoot:        expandUser(*kiloRoot),
-			cursorRoot:      expandUser(*cursorRoot),
-			ampRoot:         expandUser(*ampRoot),
-			opencodeRoot:    expandUser(*opencodeRoot),
-			piRoot:          expandUser(*piRoot),
-			openclawRoot:    expandUser(*openclawRoot),
-			crushRoot:       expandUser(*crushRoot),
-			antigravityRoot: expandUser(*antigravityRoot),
-			droidRoot:       expandUser(*droidRoot),
-			qoderRoot:       expandUser(*qoderRoot),
-			logf:            options.logf,
-		}, options)
+		params := baseParams
+		params.deviceInfo = deviceInfo
+		params.logf = options.logf
+		return syncOnce(params, options)
 	}
 
 	if daemonWorker {
@@ -454,6 +458,87 @@ type syncParams struct {
 	logf            func(format string, args ...any)
 }
 
+func detectInstalledSources(params syncParams) []string {
+	installed := make([]string, 0, len(params.sources))
+	for _, source := range params.sources {
+		if isSourceInstalled(source, params) {
+			installed = append(installed, source)
+		}
+	}
+	return installed
+}
+
+func isSourceInstalled(source string, params syncParams) bool {
+	switch source {
+	case "codex":
+		return dirExists(filepath.Join(params.codexRoot, "sessions"))
+	case "claude":
+		return dirExists(filepath.Join(params.claudeRoot, "projects"))
+	case "gemini":
+		return dirExists(filepath.Join(params.geminiRoot, "tmp"))
+	case "qwen":
+		return dirExists(filepath.Join(params.qwenRoot, "tmp")) || dirExists(filepath.Join(params.qwenRoot, "projects"))
+	case "cline":
+		return fileExists(filepath.Join(params.clineRoot, "data", "state", "taskHistory.json"))
+	case "continue":
+		return dirExists(filepath.Join(params.continueRoot, "sessions"))
+	case "kilocode":
+		for _, candidate := range kiloStorageCandidates(params.kiloRoot) {
+			if dirExists(candidate.tasksDir) {
+				return true
+			}
+		}
+		for _, dbPath := range kiloDBCandidates(params.kiloRoot) {
+			if isRegularFile(dbPath) {
+				return true
+			}
+		}
+		return false
+	case "cursor":
+		return isRegularFile(filepath.Join(params.cursorRoot, "ai-tracking", "ai-code-tracking.db")) ||
+			dirExists(filepath.Join(params.cursorRoot, "chats")) ||
+			dirExists(filepath.Join(params.cursorRoot, "projects"))
+	case "amp":
+		if dirExists(filepath.Join(params.ampRoot, "threads")) {
+			return true
+		}
+		legacyRoot := expandUser("~/.amp")
+		if params.ampRoot == legacyRoot {
+			return dirExists(filepath.Join(expandUser("~/.local/share/amp"), "threads"))
+		}
+		return false
+	case "opencode":
+		return dirExists(filepath.Join(params.opencodeRoot, "storage", "session"))
+	case "pi":
+		return dirExists(filepath.Join(params.piRoot, "agent", "sessions")) || dirExists(filepath.Join(params.piRoot, "sessions"))
+	case "openclaw":
+		return dirExists(filepath.Join(params.openclawRoot, "agents", "main", "sessions")) || dirExists(filepath.Join(params.openclawRoot, "sessions"))
+	case "crush":
+		if isRegularFile(params.crushRoot) && strings.HasSuffix(strings.ToLower(strings.TrimSpace(params.crushRoot)), ".db") {
+			return true
+		}
+		return isRegularFile(filepath.Join(params.crushRoot, "crush.db"))
+	case "antigravity":
+		return dirExists(filepath.Join(params.antigravityRoot, "brain"))
+	case "droid":
+		return dirExists(filepath.Join(params.droidRoot, "sessions"))
+	case "qoder":
+		return dirExists(filepath.Join(params.qoderRoot, "projects"))
+	default:
+		return false
+	}
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 func syncOnce(params syncParams, options syncOptions) (int, error) {
 	totalSessions := 0
 	sentPayload := false
@@ -510,7 +595,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			since := time.Time{}
 			if options.state != nil {
 				if ts, ok := options.state.LastSync[sourceName]; ok {
-					if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+					if parsed, err := parseSyncTimestamp(ts); err == nil {
 						since = parsed
 					}
 				}
@@ -545,7 +630,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			if options.state.LastSync == nil {
 				options.state.LastSync = map[string]string{}
 			}
-			options.state.LastSync[sourceName] = maxUpdated.UTC().Format(time.RFC3339)
+			options.state.LastSync[sourceName] = maxUpdated.UTC().Format(time.RFC3339Nano)
 		}
 	}
 	if options.incremental && !sentPayload {
@@ -614,6 +699,17 @@ func filterSessionsSince(sessions []SyncSession, since time.Time) ([]SyncSession
 		}
 	}
 	return filtered, maxUpdated
+}
+
+func parseSyncTimestamp(value string) (time.Time, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}, fmt.Errorf("empty timestamp")
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339, trimmed)
 }
 
 func sessionUpdatedAt(session SyncSession) time.Time {
@@ -1377,12 +1473,12 @@ func loadClaudeSessions(root string) ([]SyncSession, error) {
 		if session.ID == "" {
 			session.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
 		}
-		if session.Cwd == "" {
-			session.Cwd = normalizeCwd(extractClaudeProjectPath(path, projectsDir))
-		}
 		ok, skip := parseClaudeSession(path, &session)
 		if !ok || skip {
 			continue
+		}
+		if session.Cwd == "" {
+			session.Cwd = normalizeCwd(extractClaudeProjectPath(path, projectsDir))
 		}
 		session.Cwd = normalizeCwd(session.Cwd)
 		if session.StartedAt == "" {
