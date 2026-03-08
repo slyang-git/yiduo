@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -54,6 +56,8 @@ type SyncSession struct {
 	Title                  string        `json:"title"`
 	Model                  string        `json:"model"`
 	Cwd                    string        `json:"cwd"`
+	AgentVersion           string        `json:"agent_version,omitempty"`
+	ToolVersion            string        `json:"tool_version,omitempty"`
 	StartedAt              string        `json:"started_at"`
 	EndedAt                string        `json:"ended_at"`
 	TotalTokens            int           `json:"total_tokens"`
@@ -102,6 +106,7 @@ type syncOptions struct {
 const daemonEnv = "YIDUO_DAEMON"
 
 var version = "dev"
+var semverPattern = regexp.MustCompile(`\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b`)
 
 func main() {
 	args := os.Args[1:]
@@ -611,6 +616,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 		if options.logf != nil {
 			options.logf("sync source=%s tool=%s sessions=%d", sourceName, toolName, len(sessions))
 		}
+		annotateSessionVersions(sessions, version, detectToolVersion(sourceName, toolName))
 
 		payload := SyncPayload{
 			AgentID:  params.agentID,
@@ -4646,10 +4652,11 @@ func parseOpenCodeSession(sessionPath string, projects map[string]opencodeProjec
 	}
 
 	session := SyncSession{
-		ID:        sess.ID,
-		Title:     sess.Title,
-		StartedAt: startedAt,
-		EndedAt:   endedAt,
+		ID:          sess.ID,
+		Title:       sess.Title,
+		ToolVersion: strings.TrimSpace(sess.Version),
+		StartedAt:   startedAt,
+		EndedAt:     endedAt,
 	}
 
 	// Set directory from session or project
@@ -5049,10 +5056,11 @@ func parseAntigravityMetadata(path string) (SyncSession, bool) {
 	}
 
 	session := SyncSession{
-		ID:        id,
-		Title:     title,
-		StartedAt: updatedAt,
-		EndedAt:   updatedAt,
+		ID:          id,
+		Title:       title,
+		ToolVersion: strings.TrimSpace(meta.Version),
+		StartedAt:   updatedAt,
+		EndedAt:     updatedAt,
 	}
 	if updatedAt != "" {
 		session.Messages = append(session.Messages, SyncMessage{
@@ -6102,4 +6110,69 @@ func defaultToolName(source string) string {
 	default:
 		return source
 	}
+}
+
+func annotateSessionVersions(sessions []SyncSession, agentVersion string, toolVersion string) {
+	for i := range sessions {
+		if sessions[i].AgentVersion == "" {
+			sessions[i].AgentVersion = agentVersion
+		}
+		if sessions[i].ToolVersion == "" {
+			sessions[i].ToolVersion = toolVersion
+		}
+	}
+}
+
+func detectToolVersion(source string, toolName string) string {
+	candidates := toolVersionCommands(source, toolName)
+	for _, candidate := range candidates {
+		if len(candidate) == 0 {
+			continue
+		}
+		version := runVersionCommand(candidate[0], candidate[1:]...)
+		if version != "" {
+			return version
+		}
+	}
+	return ""
+}
+
+func toolVersionCommands(source string, toolName string) [][]string {
+	commands := [][]string{
+		{toolName, "--version"},
+		{toolName, "version"},
+	}
+	switch source {
+	case "claude":
+		commands = append(commands, []string{"claude-code", "--version"})
+	case "opencode":
+		commands = append(commands, []string{"open-code", "--version"})
+	}
+	return commands
+}
+
+func runVersionCommand(name string, args ...string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return extractVersionString(string(out))
+}
+
+func extractVersionString(raw string) string {
+	line := strings.TrimSpace(raw)
+	if line == "" {
+		return ""
+	}
+	if match := semverPattern.FindString(line); match != "" {
+		return match
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(fields[len(fields)-1])
 }
