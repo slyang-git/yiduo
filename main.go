@@ -1539,8 +1539,8 @@ func extractClaudeProjectPath(filePath string, projectsDir string) string {
 	if projectKey == "" || projectKey == "-" {
 		return ""
 	}
-	if strings.HasPrefix(projectKey, "-") {
-		projectKey = strings.TrimPrefix(projectKey, "-")
+	if after, ok :=strings.CutPrefix(projectKey, "-"); ok  {
+		projectKey = after
 	}
 	if projectKey == "" {
 		return ""
