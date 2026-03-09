@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -136,7 +137,7 @@ func main() {
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
-	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder (comma-separated)")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi (comma-separated)")
 	authToken := flag.String("auth-token", "", "auth token for sync authentication")
 	deviceToken := flag.String("device-token", "", "deprecated: use --auth-token")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
@@ -157,6 +158,8 @@ func main() {
 	antigravityRoot := flag.String("antigravity-root", envOrDefault("ANTIGRAVITY_ROOT", "~/.gemini/antigravity"), "Antigravity root")
 	droidRoot := flag.String("droid-root", envOrDefault("DROID_ROOT", "~/.factory"), "Droid root")
 	qoderRoot := flag.String("qoder-root", envOrDefault("QODER_ROOT", "~/.qoder"), "Qoder root")
+	gooseRoot := flag.String("goose-root", envOrDefault("GOOSE_ROOT", "~/.local/share/goose"), "Goose root")
+	kimiRoot := flag.String("kimi-root", envOrDefault("KIMI_ROOT", "~/.kimi"), "Kimi Code root")
 	agentID := flag.String("agent-id", "local", "agent id")
 	host := flag.String("host", hostname(), "host name")
 	if err := flag.CommandLine.Parse(args); err != nil {
@@ -338,6 +341,8 @@ func main() {
 			antigravityRoot: expandUser(*antigravityRoot),
 			droidRoot:       expandUser(*droidRoot),
 			qoderRoot:       expandUser(*qoderRoot),
+			gooseRoot:       expandUser(*gooseRoot),
+			kimiRoot:        expandUser(*kimiRoot),
 			logf:            options.logf,
 		}, options)
 	}
@@ -404,8 +409,8 @@ Sync Subcommands:
   yiduo sync log        Follow daemon log (~/.yiduo/sync.log)
 
 Key Flags:
-  --source string        Data source(s), comma-separated.
-                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder
+ --source string        Data source(s), comma-separated.
+                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi
   --daemon, -d           Run sync daemon in background
   --server string        API server base URL
   --auth-token string    Sync auth token
@@ -416,7 +421,7 @@ Key Flags:
 Root Path Flags:
   --codex-root --claude-root --gemini-root --qwen-root --cline-root --continue-root
   --kilocode-root --cursor-root --amp-root --opencode-root --pi-root --openclaw-root --crush-root
-  --antigravity-root --droid-root --qoder-root
+  --antigravity-root --droid-root --qoder-root --goose-root --kimi-root
 
 Examples:
   %s status
@@ -451,6 +456,8 @@ type syncParams struct {
 	antigravityRoot string
 	droidRoot       string
 	qoderRoot       string
+	gooseRoot       string
+	kimiRoot        string
 	logf            func(format string, args ...any)
 }
 
@@ -498,6 +505,10 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			sessions, err = loadDroidSessions(params.droidRoot)
 		case "qoder":
 			sessions, err = loadQoderSessions(params.qoderRoot)
+		case "goose":
+			sessions, err = loadGooseSessions(params.gooseRoot)
+		case "kimi":
+			sessions, err = loadKimiSessions(params.kimiRoot)
 		default:
 			return 0, fmt.Errorf("unknown source: %s", sourceName)
 		}
@@ -4114,6 +4125,760 @@ func loadOpenClawSessions(root string) ([]SyncSession, error) {
 	return sessions, nil
 }
 
+func loadGooseSessions(root string) ([]SyncSession, error) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return []SyncSession{}, nil
+	}
+
+	dbPath := strings.TrimSpace(root)
+	if dbPath == "" {
+		dbPath = filepath.Join(expandUser("~/.local/share/goose"), "sessions", "sessions.db")
+	}
+	if stat, err := os.Stat(dbPath); err == nil && !stat.IsDir() && strings.HasSuffix(strings.ToLower(dbPath), ".db") {
+		// root is already a db file path.
+	} else {
+		dbPath = filepath.Join(root, "sessions", "sessions.db")
+	}
+	info, err := os.Stat(dbPath)
+	if err != nil || info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	sessionRows, err := sqliteRows(dbPath, "SELECT id, name, description, session_type, working_dir, created_at, updated_at, provider_name, model_config_json, total_tokens, input_tokens, output_tokens, accumulated_total_tokens, accumulated_input_tokens, accumulated_output_tokens FROM sessions ORDER BY created_at ASC")
+	if err != nil {
+		return nil, err
+	}
+
+	sessionByID := make(map[string]*SyncSession, len(sessionRows))
+	order := make([]string, 0, len(sessionRows))
+	for _, row := range sessionRows {
+		if len(row) < 15 {
+			continue
+		}
+		id := strings.TrimSpace(row[0])
+		if id == "" {
+			continue
+		}
+		model := parseGooseModel(row[7], row[8])
+		inputTokens := maxInt(intFrom(row[13], 0), intFrom(row[10], 0))
+		outputTokens := maxInt(intFrom(row[14], 0), intFrom(row[11], 0))
+		totalTokens := maxInt(intFrom(row[12], 0), intFrom(row[9], 0))
+		if totalTokens == 0 {
+			totalTokens = inputTokens + outputTokens
+		}
+		sessionByID[id] = &SyncSession{
+			ID:                id,
+			Title:             firstNonEmpty(strings.TrimSpace(row[1]), strings.TrimSpace(row[2])),
+			Model:             model,
+			Cwd:               normalizeCwd(row[4]),
+			StartedAt:         parseFlexibleTimestamp(row[5]),
+			EndedAt:           parseFlexibleTimestamp(row[6]),
+			TotalTokens:       totalTokens,
+			TotalInputTokens:  inputTokens,
+			TotalOutputTokens: outputTokens,
+		}
+		order = append(order, id)
+	}
+
+	messageRows, err := sqliteRows(dbPath, "SELECT session_id, role, content_json, created_timestamp, timestamp, tokens FROM messages ORDER BY created_timestamp ASC, id ASC")
+	if err != nil {
+		return nil, err
+	}
+	messageIndexBySessionID := map[string]int{}
+	for _, row := range messageRows {
+		if len(row) < 6 {
+			continue
+		}
+		sessionID := strings.TrimSpace(row[0])
+		if sessionID == "" {
+			continue
+		}
+		session := sessionByID[sessionID]
+		if session == nil {
+			session = &SyncSession{ID: sessionID}
+			sessionByID[sessionID] = session
+			order = append(order, sessionID)
+		}
+
+		content := parseGooseContent(row[2])
+		if content == "" {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(row[1]))
+		if role == "" {
+			role = "assistant"
+		}
+		timestamp := parseFlexibleTimestamp(row[3])
+		if timestamp == "" {
+			timestamp = parseFlexibleTimestamp(row[4])
+		}
+		index := messageIndexBySessionID[sessionID]
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:       index,
+			Role:        role,
+			Content:     content,
+			Timestamp:   timestamp,
+			TotalTokens: intFrom(row[5], 0),
+		})
+		messageIndexBySessionID[sessionID] = index + 1
+		if session.Title == "" && role == "user" {
+			session.Title = firstLine(content)
+		}
+		if session.StartedAt == "" || (timestamp != "" && timestamp < session.StartedAt) {
+			session.StartedAt = timestamp
+		}
+		if session.EndedAt == "" || (timestamp != "" && timestamp > session.EndedAt) {
+			session.EndedAt = timestamp
+		}
+	}
+
+	sessions := make([]SyncSession, 0, len(order))
+	for _, id := range order {
+		session := sessionByID[id]
+		if session == nil || session.ID == "" || len(session.Messages) == 0 {
+			continue
+		}
+		if session.Title == "" {
+			if session.Cwd != "" {
+				session.Title = session.Cwd
+			} else {
+				session.Title = "Goose session"
+			}
+		}
+		if session.StartedAt == "" {
+			session.StartedAt = session.EndedAt
+		}
+		if session.EndedAt == "" {
+			session.EndedAt = session.StartedAt
+		}
+		if session.TotalTokens == 0 {
+			session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
+		}
+		sessions = append(sessions, *session)
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+	return sessions, nil
+}
+
+type kimiWorkDirMeta struct {
+	Path          string `json:"path"`
+	LastSessionID string `json:"last_session_id"`
+}
+
+type kimiConfig struct {
+	WorkDirs []kimiWorkDirMeta `json:"work_dirs"`
+}
+
+func loadKimiSessions(root string) ([]SyncSession, error) {
+	sessionsRoot := filepath.Join(root, "sessions")
+	info, err := os.Stat(sessionsRoot)
+	if err != nil || !info.IsDir() {
+		return []SyncSession{}, nil
+	}
+
+	workDirsByHash := loadKimiWorkDirs(root)
+	lastHistoryByHash := loadKimiUserHistory(root)
+
+	hashEntries, err := os.ReadDir(sessionsRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []SyncSession
+	for _, hashEntry := range hashEntries {
+		if !hashEntry.IsDir() {
+			continue
+		}
+		hashID := hashEntry.Name()
+		workDir := workDirsByHash[hashID]
+		sessionEntries, err := os.ReadDir(filepath.Join(sessionsRoot, hashID))
+		if err != nil {
+			continue
+		}
+		for _, sessionEntry := range sessionEntries {
+			if !sessionEntry.IsDir() {
+				continue
+			}
+			sessionPath := filepath.Join(sessionsRoot, hashID, sessionEntry.Name())
+			session, ok := parseKimiSession(sessionPath, workDir, lastHistoryByHash[hashID])
+			if ok {
+				sessions = append(sessions, session)
+			}
+		}
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+	return sessions, nil
+}
+
+func loadKimiWorkDirs(root string) map[string]string {
+	configPath := filepath.Join(root, "kimi.json")
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return map[string]string{}
+	}
+	var cfg kimiConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return map[string]string{}
+	}
+	workDirsByHash := make(map[string]string, len(cfg.WorkDirs))
+	for _, item := range cfg.WorkDirs {
+		path := normalizeCwd(item.Path)
+		if path == "" {
+			continue
+		}
+		workDirsByHash[kimiWorkDirHash(path)] = path
+	}
+	return workDirsByHash
+}
+
+func loadKimiUserHistory(root string) map[string]string {
+	historyDir := filepath.Join(root, "user-history")
+	entries, err := os.ReadDir(historyDir)
+	if err != nil {
+		return map[string]string{}
+	}
+	lastByHash := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(historyDir, entry.Name())
+		file, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		last := ""
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			item := map[string]any{}
+			dec := json.NewDecoder(strings.NewReader(line))
+			dec.UseNumber()
+			if err := dec.Decode(&item); err != nil {
+				continue
+			}
+			if content := strings.TrimSpace(stringFrom(item["content"])); content != "" {
+				last = content
+			}
+		}
+		_ = file.Close()
+		if last != "" {
+			lastByHash[strings.TrimSuffix(entry.Name(), ".jsonl")] = last
+		}
+	}
+	return lastByHash
+}
+
+func parseKimiSession(sessionPath string, workDir string, historyFallback string) (SyncSession, bool) {
+	session := SyncSession{
+		ID:  filepath.Base(sessionPath),
+		Cwd: normalizeCwd(workDir),
+	}
+
+	wirePath := filepath.Join(sessionPath, "wire.jsonl")
+	contextPath := filepath.Join(sessionPath, "context.jsonl")
+
+	var startedAt time.Time
+	var endedAt time.Time
+	msgIndex := 0
+	pendingToolArgs := map[string]string{}
+	currentAssistantParts := make([]string, 0)
+	usageByMessageID := map[string]tokenTotals{}
+
+	flushAssistant := func(timestamp string) {
+		content := strings.TrimSpace(strings.Join(currentAssistantParts, "\n"))
+		if content == "" {
+			currentAssistantParts = currentAssistantParts[:0]
+			return
+		}
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:     msgIndex,
+			Role:      "assistant",
+			Content:   content,
+			Timestamp: timestamp,
+		})
+		msgIndex++
+		currentAssistantParts = currentAssistantParts[:0]
+	}
+
+	if file, err := os.Open(wirePath); err == nil {
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			item := map[string]any{}
+			dec := json.NewDecoder(strings.NewReader(line))
+			dec.UseNumber()
+			if err := dec.Decode(&item); err != nil {
+				continue
+			}
+			if strings.TrimSpace(stringFrom(item["type"])) == "metadata" {
+				continue
+			}
+
+			timestamp := parseKimiTimestamp(item["timestamp"])
+			updateTimeBounds(&startedAt, &endedAt, timestamp)
+
+			message := mapFrom(item["message"])
+			msgType := strings.TrimSpace(stringFrom(message["type"]))
+			payload := mapFrom(message["payload"])
+
+			switch msgType {
+			case "TurnBegin":
+				flushAssistant(timestamp)
+				content := parseKimiContentValue(payload["user_input"])
+				if content == "" {
+					continue
+				}
+				session.Messages = append(session.Messages, SyncMessage{
+					Index:     msgIndex,
+					Role:      "user",
+					Content:   content,
+					Timestamp: timestamp,
+				})
+				msgIndex++
+				if session.Title == "" {
+					session.Title = firstLine(content)
+				}
+			case "ContentPart":
+				if part := parseKimiContentPart(payload); part != "" {
+					currentAssistantParts = append(currentAssistantParts, part)
+				}
+			case "ToolCall":
+				flushAssistant(timestamp)
+				id := strings.TrimSpace(stringFrom(payload["id"]))
+				functionObj := mapFrom(payload["function"])
+				name := strings.TrimSpace(stringFrom(functionObj["name"]))
+				args := strings.TrimSpace(stringFrom(functionObj["arguments"]))
+				if id != "" {
+					pendingToolArgs[id] = args
+				}
+				content := "[tool_use]"
+				if name != "" {
+					content = "[tool_use] " + name
+				}
+				if args != "" {
+					content += "\n" + args
+				}
+				session.Messages = append(session.Messages, SyncMessage{
+					Index:     msgIndex,
+					Role:      "assistant",
+					Content:   strings.TrimSpace(content),
+					Timestamp: timestamp,
+				})
+				msgIndex++
+			case "ToolCallPart":
+				argumentsPart := strings.TrimSpace(stringFrom(payload["arguments_part"]))
+				if argumentsPart == "" {
+					continue
+				}
+				targetID := strings.TrimSpace(firstNonEmpty(
+					stringFrom(payload["tool_call_id"]),
+					stringFrom(payload["id"]),
+				))
+				if targetID != "" {
+					pendingToolArgs[targetID] += argumentsPart
+					continue
+				}
+				for id, current := range pendingToolArgs {
+					pendingToolArgs[id] = current + argumentsPart
+					break
+				}
+			case "ToolResult":
+				flushAssistant(timestamp)
+				content := parseKimiToolResult(payload, pendingToolArgs)
+				if content == "" {
+					continue
+				}
+				session.Messages = append(session.Messages, SyncMessage{
+					Index:     msgIndex,
+					Role:      "assistant",
+					Content:   content,
+					Timestamp: timestamp,
+				})
+				msgIndex++
+			case "ApprovalRequest":
+				flushAssistant(timestamp)
+				content := strings.TrimSpace(strings.Join([]string{
+					"[approval] " + strings.TrimSpace(stringFrom(payload["action"])),
+					strings.TrimSpace(stringFrom(payload["description"])),
+				}, "\n"))
+				content = strings.TrimSpace(content)
+				if content != "" {
+					session.Messages = append(session.Messages, SyncMessage{
+						Index:     msgIndex,
+						Role:      "assistant",
+						Content:   content,
+						Timestamp: timestamp,
+					})
+					msgIndex++
+				}
+			case "QuestionRequest":
+				flushAssistant(timestamp)
+				if prompt := parseKimiQuestionRequest(payload); prompt != "" {
+					session.Messages = append(session.Messages, SyncMessage{
+						Index:     msgIndex,
+						Role:      "assistant",
+						Content:   prompt,
+						Timestamp: timestamp,
+					})
+					msgIndex++
+				}
+			case "StatusUpdate":
+				accumulateKimiUsage(usageByMessageID, payload)
+			case "TurnEnd", "StepInterrupted":
+				flushAssistant(timestamp)
+			}
+		}
+		flushTimestamp := ""
+		if !endedAt.IsZero() {
+			flushTimestamp = endedAt.UTC().Format(time.RFC3339)
+		}
+		flushAssistant(flushTimestamp)
+		_ = file.Close()
+	}
+
+	if len(session.Messages) == 0 {
+		parseKimiContextFallback(contextPath, &session, &msgIndex, &startedAt, &endedAt)
+	}
+
+	for _, usage := range usageByMessageID {
+		session.TotalInputTokens += usage.inputTokens
+		session.TotalOutputTokens += usage.outputTokens
+		session.TotalCachedInputTokens += usage.cachedInputTokens
+	}
+	session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens
+
+	if session.Title == "" && historyFallback != "" {
+		session.Title = firstLine(historyFallback)
+	}
+	if session.Title == "" {
+		if session.Cwd != "" {
+			session.Title = session.Cwd
+		} else {
+			session.Title = "Kimi session"
+		}
+	}
+	if session.Cwd == "" {
+		session.Cwd = normalizeCwd(session.Cwd)
+	}
+	if session.StartedAt == "" && !startedAt.IsZero() {
+		session.StartedAt = startedAt.UTC().Format(time.RFC3339)
+	}
+	if session.EndedAt == "" && !endedAt.IsZero() {
+		session.EndedAt = endedAt.UTC().Format(time.RFC3339)
+	}
+	if session.StartedAt == "" {
+		if stat, err := os.Stat(wirePath); err == nil {
+			session.StartedAt = stat.ModTime().UTC().Format(time.RFC3339)
+		} else if stat, err := os.Stat(contextPath); err == nil {
+			session.StartedAt = stat.ModTime().UTC().Format(time.RFC3339)
+		}
+	}
+	if session.EndedAt == "" {
+		session.EndedAt = session.StartedAt
+	}
+
+	if session.ID == "" || len(session.Messages) == 0 {
+		return SyncSession{}, false
+	}
+	return session, true
+}
+
+func parseKimiContextFallback(path string, session *SyncSession, msgIndex *int, startedAt *time.Time, endedAt *time.Time) {
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(firstNonEmpty(
+			stringFrom(item["role"]),
+			stringFrom(item["sender"]),
+			stringFrom(item["type"]),
+		)))
+		switch role {
+		case "human":
+			role = "user"
+		case "ai":
+			role = "assistant"
+		}
+		if role != "user" && role != "assistant" && role != "system" {
+			continue
+		}
+		content := parseKimiContentValue(item["content"])
+		if content == "" {
+			content = strings.TrimSpace(stringFrom(item["text"]))
+		}
+		if content == "" {
+			continue
+		}
+		timestamp := parseKimiTimestamp(firstNonEmpty(
+			stringFrom(item["timestamp"]),
+			stringFrom(item["created_at"]),
+			stringFrom(item["updated_at"]),
+		))
+		updateTimeBounds(startedAt, endedAt, timestamp)
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:     *msgIndex,
+			Role:      role,
+			Content:   content,
+			Timestamp: timestamp,
+		})
+		*msgIndex = *msgIndex + 1
+		if session.Title == "" && role == "user" {
+			session.Title = firstLine(content)
+		}
+	}
+}
+
+func parseGooseModel(providerName string, modelConfigRaw string) string {
+	model := strings.TrimSpace(providerName)
+	if modelConfigRaw == "" {
+		return model
+	}
+	payload := map[string]any{}
+	dec := json.NewDecoder(strings.NewReader(modelConfigRaw))
+	dec.UseNumber()
+	if err := dec.Decode(&payload); err != nil {
+		return model
+	}
+	return firstNonEmpty(
+		strings.TrimSpace(stringFrom(payload["model_name"])),
+		strings.TrimSpace(stringFrom(payload["model"])),
+		model,
+	)
+}
+
+func parseGooseContent(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var payload any
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&payload); err != nil {
+		return raw
+	}
+	return parseKimiContentValue(payload)
+}
+
+func parseKimiContentPart(payload map[string]any) string {
+	switch strings.TrimSpace(stringFrom(payload["type"])) {
+	case "text":
+		return strings.TrimSpace(stringFrom(payload["text"]))
+	case "think":
+		thinking := strings.TrimSpace(firstNonEmpty(stringFrom(payload["think"]), stringFrom(payload["text"])))
+		if thinking == "" {
+			return ""
+		}
+		return "[thinking]\n" + thinking
+	case "image_url", "video_url", "audio_url":
+		url := strings.TrimSpace(firstNonEmpty(
+			stringFrom(payload["url"]),
+			stringFrom(mapFrom(payload["image_url"])["url"]),
+			stringFrom(mapFrom(payload["video_url"])["url"]),
+			stringFrom(mapFrom(payload["audio_url"])["url"]),
+		))
+		return url
+	default:
+		return strings.TrimSpace(parseKimiContentValue(payload))
+	}
+}
+
+func parseKimiToolResult(payload map[string]any, pendingToolArgs map[string]string) string {
+	toolCallID := strings.TrimSpace(stringFrom(payload["tool_call_id"]))
+	returnValue := mapFrom(payload["return_value"])
+	outputText := parseKimiContentValue(returnValue["output"])
+	messageText := strings.TrimSpace(stringFrom(returnValue["message"]))
+	displayText := parseKimiContentValue(returnValue["display"])
+
+	parts := make([]string, 0, 4)
+	prefix := "[tool_result]"
+	if toolCallID != "" {
+		if args := strings.TrimSpace(pendingToolArgs[toolCallID]); args != "" {
+			prefix += "\n" + args
+		}
+		delete(pendingToolArgs, toolCallID)
+	}
+	parts = append(parts, prefix)
+	if outputText != "" {
+		parts = append(parts, outputText)
+	}
+	if messageText != "" {
+		parts = append(parts, messageText)
+	}
+	if displayText != "" {
+		parts = append(parts, displayText)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func parseKimiQuestionRequest(payload map[string]any) string {
+	questions, ok := payload["questions"].([]any)
+	if !ok || len(questions) == 0 {
+		return ""
+	}
+	lines := []string{"[question]"}
+	for _, question := range questions {
+		item := mapFrom(question)
+		text := strings.TrimSpace(stringFrom(item["question"]))
+		if text != "" {
+			lines = append(lines, text)
+		}
+		options, _ := item["options"].([]any)
+		for _, option := range options {
+			label := strings.TrimSpace(stringFrom(mapFrom(option)["label"]))
+			if label != "" {
+				lines = append(lines, "- "+label)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func parseKimiContentValue(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := parseKimiContentValue(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	case map[string]any:
+		entryType := strings.TrimSpace(stringFrom(v["type"]))
+		switch entryType {
+		case "text":
+			return strings.TrimSpace(stringFrom(v["text"]))
+		case "think":
+			return strings.TrimSpace(firstNonEmpty(stringFrom(v["think"]), stringFrom(v["text"])))
+		case "tool_use", "toolCall":
+			name := strings.TrimSpace(firstNonEmpty(stringFrom(v["name"]), stringFrom(mapFrom(v["function"])["name"])))
+			args := strings.TrimSpace(firstNonEmpty(
+				stringFrom(v["arguments"]),
+				stringifyJSON(v["input"]),
+				stringFrom(mapFrom(v["function"])["arguments"]),
+			))
+			if name == "" && args == "" {
+				return "[tool_use]"
+			}
+			if args == "" {
+				return "[tool_use] " + name
+			}
+			if name == "" {
+				return "[tool_use]\n" + args
+			}
+			return "[tool_use] " + name + "\n" + args
+		case "tool_result", "toolResult":
+			content := strings.TrimSpace(firstNonEmpty(
+				parseKimiContentValue(v["content"]),
+				parseKimiContentValue(v["output"]),
+				stringFrom(v["message"]),
+			))
+			if content == "" {
+				return "[tool_result]"
+			}
+			return "[tool_result]\n" + content
+		case "image_url", "video_url", "audio_url":
+			return strings.TrimSpace(firstNonEmpty(
+				stringFrom(v["url"]),
+				stringFrom(mapFrom(v["image_url"])["url"]),
+				stringFrom(mapFrom(v["video_url"])["url"]),
+				stringFrom(mapFrom(v["audio_url"])["url"]),
+			))
+		}
+		for _, key := range []string{"text", "content", "output", "message"} {
+			if text := strings.TrimSpace(parseKimiContentValue(v[key])); text != "" {
+				return text
+			}
+		}
+		return strings.TrimSpace(stringifyJSON(v))
+	default:
+		return strings.TrimSpace(stringFrom(v))
+	}
+}
+
+func parseKimiTimestamp(value any) string {
+	return parseFlexibleTimestamp(value)
+}
+
+func accumulateKimiUsage(usageByMessageID map[string]tokenTotals, payload map[string]any) {
+	usage := mapFrom(payload["token_usage"])
+	if len(usage) == 0 {
+		return
+	}
+	messageID := strings.TrimSpace(stringFrom(payload["message_id"]))
+	if messageID == "" {
+		messageID = fmt.Sprintf("__status_%d", len(usageByMessageID))
+	}
+	inputTokens := intFrom(usage["input"], 0)
+	if inputTokens == 0 {
+		inputTokens = intFrom(usage["input_other"], 0) + intFrom(usage["input_cache_read"], 0) + intFrom(usage["input_cache_creation"], 0)
+	}
+	outputTokens := intFrom(usage["output"], 0)
+	cachedTokens := intFrom(usage["input_cache_read"], 0) + intFrom(usage["input_cache_creation"], 0)
+	usageByMessageID[messageID] = tokenTotals{
+		totalTokens:       inputTokens + outputTokens,
+		inputTokens:       inputTokens,
+		outputTokens:      outputTokens,
+		cachedInputTokens: cachedTokens,
+	}
+}
+
+func updateTimeBounds(startedAt *time.Time, endedAt *time.Time, timestamp string) {
+	if strings.TrimSpace(timestamp) == "" {
+		return
+	}
+	ts, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return
+	}
+	if startedAt.IsZero() || ts.Before(*startedAt) {
+		*startedAt = ts
+	}
+	if endedAt.IsZero() || ts.After(*endedAt) {
+		*endedAt = ts
+	}
+}
+
+func kimiWorkDirHash(path string) string {
+	sum := md5.Sum([]byte(strings.TrimSpace(path)))
+	return hex.EncodeToString(sum[:])
+}
+
 func loadCrushSessions(root string) ([]SyncSession, error) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		return []SyncSession{}, nil
@@ -4301,6 +5066,49 @@ func parseCrushParts(raw string) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func parseFlexibleTimestamp(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return ""
+		}
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02 15:04:05.999999999-07:00",
+			"2006-01-02 15:04:05.999999999",
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05",
+		} {
+			if ts, err := time.Parse(layout, trimmed); err == nil {
+				return ts.UTC().Format(time.RFC3339)
+			}
+		}
+		if raw := int64From(trimmed, 0); raw > 0 {
+			return formatUnixFlexible(raw)
+		}
+		if rawFloat, err := strconv.ParseFloat(trimmed, 64); err == nil && rawFloat > 0 {
+			return formatUnixFlexible(int64(rawFloat * 1000))
+		}
+		return ""
+	default:
+		if raw := int64From(v, 0); raw > 0 {
+			return formatUnixFlexible(raw)
+		}
+	}
+	return ""
 }
 
 func formatUnixFlexible(value any) string {
@@ -5907,6 +6715,8 @@ func parseSources(value string) ([]string, error) {
 			"antigravity",
 			"droid",
 			"qoder",
+			"goose",
+			"kimi",
 		}, nil
 	}
 	parts := strings.Split(normalized, ",")
@@ -5927,6 +6737,8 @@ func parseSources(value string) ([]string, error) {
 		"antigravity": true,
 		"droid":       true,
 		"qoder":       true,
+		"goose":       true,
+		"kimi":        true,
 	}
 	seen := map[string]bool{}
 	var sources []string
@@ -5953,6 +6765,8 @@ func parseSources(value string) ([]string, error) {
 				"antigravity",
 				"droid",
 				"qoder",
+				"goose",
+				"kimi",
 			}, nil
 		}
 		if !allowed[source] {
@@ -6003,6 +6817,10 @@ func defaultToolName(source string) string {
 		return "droid"
 	case "qoder":
 		return "qoder"
+	case "goose":
+		return "goose"
+	case "kimi":
+		return "kimi-code"
 	default:
 		return source
 	}

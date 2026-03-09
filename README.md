@@ -2,6 +2,28 @@
 
 Device sync agent for AI Wrapped.
 
+## Brand Assets
+
+Project-local tool brand icons live under `assets/brands/`.
+
+- Goose: `assets/brands/goose.png`
+- Kimi Code: `assets/brands/kimi.ico`
+
+Canonical source URLs are recorded in `assets/brands/manifest.json`.
+
+## Frontend
+
+Static frontend files live under `web/`.
+
+For local preview:
+
+```sh
+cd web
+python3 -m http.server 4173
+```
+
+Then open `http://127.0.0.1:4173/`.
+
 ## Install
 
 Installer script is hosted and maintained externally at `https://yiduo.one/install.sh` (not in this repository).
