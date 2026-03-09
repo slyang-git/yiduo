@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/md5"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -55,6 +57,8 @@ type SyncSession struct {
 	Title                  string        `json:"title"`
 	Model                  string        `json:"model"`
 	Cwd                    string        `json:"cwd"`
+	AgentVersion           string        `json:"agent_version,omitempty"`
+	ToolVersion            string        `json:"tool_version,omitempty"`
 	StartedAt              string        `json:"started_at"`
 	EndedAt                string        `json:"ended_at"`
 	TotalTokens            int           `json:"total_tokens"`
@@ -103,6 +107,7 @@ type syncOptions struct {
 const daemonEnv = "YIDUO_DAEMON"
 
 var version = "dev"
+var semverPattern = regexp.MustCompile(`\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b`)
 
 func main() {
 	args := os.Args[1:]
@@ -293,7 +298,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid source: %v\n", err)
 		os.Exit(1)
 	}
-	baseDeviceInfo.SourcesEnabled = append([]string(nil), sources...)
 
 	toolOverride := strings.TrimSpace(*tool)
 	if toolOverride != "" && len(sources) > 1 {
@@ -308,6 +312,35 @@ func main() {
 		options.state = &state
 	}
 
+	baseParams := syncParams{
+		server:          resolvedServer,
+		deviceToken:     resolvedDeviceToken,
+		agentID:         *agentID,
+		host:            *host,
+		toolOverride:    toolOverride,
+		sources:         sources,
+		codexRoot:       expandUser(*codexRoot),
+		claudeRoot:      expandUser(*claudeRoot),
+		geminiRoot:      expandUser(*geminiRoot),
+		qwenRoot:        expandUser(*qwenRoot),
+		clineRoot:       expandUser(*clineRoot),
+		continueRoot:    expandUser(*continueRoot),
+		kiloRoot:        expandUser(*kiloRoot),
+		cursorRoot:      expandUser(*cursorRoot),
+		ampRoot:         expandUser(*ampRoot),
+		opencodeRoot:    expandUser(*opencodeRoot),
+		piRoot:          expandUser(*piRoot),
+		openclawRoot:    expandUser(*openclawRoot),
+		crushRoot:       expandUser(*crushRoot),
+		antigravityRoot: expandUser(*antigravityRoot),
+		droidRoot:       expandUser(*droidRoot),
+		qoderRoot:       expandUser(*qoderRoot),
+		gooseRoot:       expandUser(*gooseRoot),
+		kimiRoot:        expandUser(*kimiRoot),
+		logf:            options.logf,
+	}
+	baseDeviceInfo.SourcesEnabled = detectInstalledSources(baseParams)
+
 	runOnce := func() (int, error) {
 		if options.logf != nil {
 			options.logf("yiduo sync start")
@@ -317,34 +350,10 @@ func main() {
 		deviceInfo.LastSyncAttemptAt = now
 		deviceInfo.LastSyncOKAt = now
 		deviceInfo.DaemonStartedAt = daemonStartedAt
-		return syncOnce(syncParams{
-			server:          resolvedServer,
-			deviceToken:     resolvedDeviceToken,
-			deviceInfo:      deviceInfo,
-			agentID:         *agentID,
-			host:            *host,
-			toolOverride:    toolOverride,
-			sources:         sources,
-			codexRoot:       expandUser(*codexRoot),
-			claudeRoot:      expandUser(*claudeRoot),
-			geminiRoot:      expandUser(*geminiRoot),
-			qwenRoot:        expandUser(*qwenRoot),
-			clineRoot:       expandUser(*clineRoot),
-			continueRoot:    expandUser(*continueRoot),
-			kiloRoot:        expandUser(*kiloRoot),
-			cursorRoot:      expandUser(*cursorRoot),
-			ampRoot:         expandUser(*ampRoot),
-			opencodeRoot:    expandUser(*opencodeRoot),
-			piRoot:          expandUser(*piRoot),
-			openclawRoot:    expandUser(*openclawRoot),
-			crushRoot:       expandUser(*crushRoot),
-			antigravityRoot: expandUser(*antigravityRoot),
-			droidRoot:       expandUser(*droidRoot),
-			qoderRoot:       expandUser(*qoderRoot),
-			gooseRoot:       expandUser(*gooseRoot),
-			kimiRoot:        expandUser(*kimiRoot),
-			logf:            options.logf,
-		}, options)
+		params := baseParams
+		params.deviceInfo = deviceInfo
+		params.logf = options.logf
+		return syncOnce(params, options)
 	}
 
 	if daemonWorker {
@@ -429,7 +438,7 @@ Examples:
   %s sync --source openclaw
   %s sync --daemon
   %s sync log
-`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
+`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
 }
 
 type syncParams struct {
@@ -459,6 +468,87 @@ type syncParams struct {
 	gooseRoot       string
 	kimiRoot        string
 	logf            func(format string, args ...any)
+}
+
+func detectInstalledSources(params syncParams) []string {
+	installed := make([]string, 0, len(params.sources))
+	for _, source := range params.sources {
+		if isSourceInstalled(source, params) {
+			installed = append(installed, source)
+		}
+	}
+	return installed
+}
+
+func isSourceInstalled(source string, params syncParams) bool {
+	switch source {
+	case "codex":
+		return dirExists(filepath.Join(params.codexRoot, "sessions"))
+	case "claude":
+		return dirExists(filepath.Join(params.claudeRoot, "projects"))
+	case "gemini":
+		return dirExists(filepath.Join(params.geminiRoot, "tmp"))
+	case "qwen":
+		return dirExists(filepath.Join(params.qwenRoot, "tmp")) || dirExists(filepath.Join(params.qwenRoot, "projects"))
+	case "cline":
+		return fileExists(filepath.Join(params.clineRoot, "data", "state", "taskHistory.json"))
+	case "continue":
+		return dirExists(filepath.Join(params.continueRoot, "sessions"))
+	case "kilocode":
+		for _, candidate := range kiloStorageCandidates(params.kiloRoot) {
+			if dirExists(candidate.tasksDir) {
+				return true
+			}
+		}
+		for _, dbPath := range kiloDBCandidates(params.kiloRoot) {
+			if isRegularFile(dbPath) {
+				return true
+			}
+		}
+		return false
+	case "cursor":
+		return isRegularFile(filepath.Join(params.cursorRoot, "ai-tracking", "ai-code-tracking.db")) ||
+			dirExists(filepath.Join(params.cursorRoot, "chats")) ||
+			dirExists(filepath.Join(params.cursorRoot, "projects"))
+	case "amp":
+		if dirExists(filepath.Join(params.ampRoot, "threads")) {
+			return true
+		}
+		legacyRoot := expandUser("~/.amp")
+		if params.ampRoot == legacyRoot {
+			return dirExists(filepath.Join(expandUser("~/.local/share/amp"), "threads"))
+		}
+		return false
+	case "opencode":
+		return dirExists(filepath.Join(params.opencodeRoot, "storage", "session"))
+	case "pi":
+		return dirExists(filepath.Join(params.piRoot, "agent", "sessions")) || dirExists(filepath.Join(params.piRoot, "sessions"))
+	case "openclaw":
+		return dirExists(filepath.Join(params.openclawRoot, "agents", "main", "sessions")) || dirExists(filepath.Join(params.openclawRoot, "sessions"))
+	case "crush":
+		if isRegularFile(params.crushRoot) && strings.HasSuffix(strings.ToLower(strings.TrimSpace(params.crushRoot)), ".db") {
+			return true
+		}
+		return isRegularFile(filepath.Join(params.crushRoot, "crush.db"))
+	case "antigravity":
+		return dirExists(filepath.Join(params.antigravityRoot, "brain"))
+	case "droid":
+		return dirExists(filepath.Join(params.droidRoot, "sessions"))
+	case "qoder":
+		return dirExists(filepath.Join(params.qoderRoot, "projects"))
+	default:
+		return false
+	}
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func syncOnce(params syncParams, options syncOptions) (int, error) {
@@ -521,7 +611,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			since := time.Time{}
 			if options.state != nil {
 				if ts, ok := options.state.LastSync[sourceName]; ok {
-					if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+					if parsed, err := parseSyncTimestamp(ts); err == nil {
 						since = parsed
 					}
 				}
@@ -537,6 +627,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 		if options.logf != nil {
 			options.logf("sync source=%s tool=%s sessions=%d", sourceName, toolName, len(sessions))
 		}
+		annotateSessionVersions(sessions, version, detectToolVersion(sourceName, toolName))
 
 		payload := SyncPayload{
 			AgentID:  params.agentID,
@@ -556,7 +647,7 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			if options.state.LastSync == nil {
 				options.state.LastSync = map[string]string{}
 			}
-			options.state.LastSync[sourceName] = maxUpdated.UTC().Format(time.RFC3339)
+			options.state.LastSync[sourceName] = maxUpdated.UTC().Format(time.RFC3339Nano)
 		}
 	}
 	if options.incremental && !sentPayload {
@@ -625,6 +716,17 @@ func filterSessionsSince(sessions []SyncSession, since time.Time) ([]SyncSession
 		}
 	}
 	return filtered, maxUpdated
+}
+
+func parseSyncTimestamp(value string) (time.Time, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}, fmt.Errorf("empty timestamp")
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339, trimmed)
 }
 
 func sessionUpdatedAt(session SyncSession) time.Time {
@@ -1388,12 +1490,12 @@ func loadClaudeSessions(root string) ([]SyncSession, error) {
 		if session.ID == "" {
 			session.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
 		}
-		if session.Cwd == "" {
-			session.Cwd = normalizeCwd(extractClaudeProjectPath(path, projectsDir))
-		}
 		ok, skip := parseClaudeSession(path, &session)
 		if !ok || skip {
 			continue
+		}
+		if session.Cwd == "" {
+			session.Cwd = normalizeCwd(extractClaudeProjectPath(path, projectsDir))
 		}
 		session.Cwd = normalizeCwd(session.Cwd)
 		if session.StartedAt == "" {
@@ -5358,10 +5460,11 @@ func parseOpenCodeSession(sessionPath string, projects map[string]opencodeProjec
 	}
 
 	session := SyncSession{
-		ID:        sess.ID,
-		Title:     sess.Title,
-		StartedAt: startedAt,
-		EndedAt:   endedAt,
+		ID:          sess.ID,
+		Title:       sess.Title,
+		ToolVersion: strings.TrimSpace(sess.Version),
+		StartedAt:   startedAt,
+		EndedAt:     endedAt,
 	}
 
 	// Set directory from session or project
@@ -5761,10 +5864,11 @@ func parseAntigravityMetadata(path string) (SyncSession, bool) {
 	}
 
 	session := SyncSession{
-		ID:        id,
-		Title:     title,
-		StartedAt: updatedAt,
-		EndedAt:   updatedAt,
+		ID:          id,
+		Title:       title,
+		ToolVersion: strings.TrimSpace(meta.Version),
+		StartedAt:   updatedAt,
+		EndedAt:     updatedAt,
 	}
 	if updatedAt != "" {
 		session.Messages = append(session.Messages, SyncMessage{
@@ -6824,4 +6928,69 @@ func defaultToolName(source string) string {
 	default:
 		return source
 	}
+}
+
+func annotateSessionVersions(sessions []SyncSession, agentVersion string, toolVersion string) {
+	for i := range sessions {
+		if sessions[i].AgentVersion == "" {
+			sessions[i].AgentVersion = agentVersion
+		}
+		if sessions[i].ToolVersion == "" {
+			sessions[i].ToolVersion = toolVersion
+		}
+	}
+}
+
+func detectToolVersion(source string, toolName string) string {
+	candidates := toolVersionCommands(source, toolName)
+	for _, candidate := range candidates {
+		if len(candidate) == 0 {
+			continue
+		}
+		version := runVersionCommand(candidate[0], candidate[1:]...)
+		if version != "" {
+			return version
+		}
+	}
+	return ""
+}
+
+func toolVersionCommands(source string, toolName string) [][]string {
+	commands := [][]string{
+		{toolName, "--version"},
+		{toolName, "version"},
+	}
+	switch source {
+	case "claude":
+		commands = append(commands, []string{"claude-code", "--version"})
+	case "opencode":
+		commands = append(commands, []string{"open-code", "--version"})
+	}
+	return commands
+}
+
+func runVersionCommand(name string, args ...string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return extractVersionString(string(out))
+}
+
+func extractVersionString(raw string) string {
+	line := strings.TrimSpace(raw)
+	if line == "" {
+		return ""
+	}
+	if match := semverPattern.FindString(line); match != "" {
+		return match
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(fields[len(fields)-1])
 }
