@@ -3,8 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/md5"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -1539,7 +1539,7 @@ func extractClaudeProjectPath(filePath string, projectsDir string) string {
 	if projectKey == "" || projectKey == "-" {
 		return ""
 	}
-	if after, ok :=strings.CutPrefix(projectKey, "-"); ok  {
+	if after, ok := strings.CutPrefix(projectKey, "-"); ok {
 		projectKey = after
 	}
 	if projectKey == "" {
@@ -3504,7 +3504,8 @@ func loadCursorTranscriptSessions(root string, logf func(format string, args ...
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if !strings.HasSuffix(strings.ToLower(d.Name()), ".txt") {
+		name := strings.ToLower(d.Name())
+		if !strings.HasSuffix(name, ".txt") && !strings.HasSuffix(name, ".jsonl") {
 			return nil
 		}
 		if !strings.Contains(filepath.ToSlash(path), "/agent-transcripts/") {
@@ -3531,6 +3532,15 @@ func loadCursorTranscriptSessions(root string, logf func(format string, args ...
 }
 
 func parseCursorTranscript(path string, projectsRoot string) (SyncSession, bool) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jsonl":
+		return parseCursorTranscriptJSONL(path, projectsRoot)
+	default:
+		return parseCursorTranscriptText(path, projectsRoot)
+	}
+}
+
+func parseCursorTranscriptText(path string, projectsRoot string) (SyncSession, bool) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return SyncSession{}, false
@@ -3598,6 +3608,85 @@ func parseCursorTranscript(path string, projectsRoot string) (SyncSession, bool)
 		current = append(current, line)
 	}
 	flush()
+
+	if len(session.Messages) == 0 {
+		return SyncSession{}, false
+	}
+	if session.Title == "" {
+		if session.Cwd != "" {
+			session.Title = session.Cwd
+		} else {
+			session.Title = "Cursor transcript"
+		}
+	}
+	return session, true
+}
+
+func parseCursorTranscriptJSONL(path string, projectsRoot string) (SyncSession, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return SyncSession{}, false
+	}
+	defer file.Close()
+
+	sessionID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if sessionID == "" {
+		return SyncSession{}, false
+	}
+
+	endedAt := ""
+	if stat, err := os.Stat(path); err == nil {
+		endedAt = stat.ModTime().UTC().Format(time.RFC3339)
+	}
+
+	session := SyncSession{
+		ID:        "cursor-transcript:" + sessionID,
+		Title:     "",
+		Cwd:       normalizeCwd(extractCursorProjectPath(path, projectsRoot)),
+		StartedAt: endedAt,
+		EndedAt:   endedAt,
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	msgIndex := 0
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var item map[string]any
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			continue
+		}
+
+		role := normalizeStructuredMessageRole(stringFrom(item["role"]), nil)
+		if role == "" {
+			continue
+		}
+
+		message := mapFrom(item["message"])
+		content := strings.TrimSpace(parseMessageContent(message["content"]))
+		if content == "" {
+			content = strings.TrimSpace(stringFrom(message["text"]))
+		}
+		content = cleanCursorTranscriptContent(content)
+		if content == "" {
+			continue
+		}
+
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:   msgIndex,
+			Role:    role,
+			Content: content,
+		})
+		if session.Title == "" && role == "user" {
+			session.Title = content
+		}
+		msgIndex++
+	}
 
 	if len(session.Messages) == 0 {
 		return SyncSession{}, false
@@ -3707,10 +3796,7 @@ func parseCursorChatStore(dbPath string, logf func(format string, args ...any)) 
 	logCursorf(logf, "cursor: chat message blobs decoded=%d", len(messageByID))
 
 	startedAt := formatMillis(meta.CreatedAt)
-	endedAt := ""
-	if stat, err := os.Stat(dbPath); err == nil {
-		endedAt = stat.ModTime().UTC().Format(time.RFC3339)
-	}
+	endedAt := latestFileTimestamp(dbPath, dbPath+"-shm", dbPath+"-wal")
 	if startedAt == "" {
 		startedAt = endedAt
 	}
@@ -3762,6 +3848,26 @@ func parseCursorChatStore(dbPath string, logf func(format string, args ...any)) 
 	}
 	logCursorf(logf, "cursor: chat session id=%s title=%s messages=%d", session.ID, session.Title, len(session.Messages))
 	return session, session.ID != ""
+}
+
+func latestFileTimestamp(paths ...string) string {
+	var latest time.Time
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		stat, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if stat.ModTime().After(latest) {
+			latest = stat.ModTime()
+		}
+	}
+	if latest.IsZero() {
+		return ""
+	}
+	return latest.UTC().Format(time.RFC3339)
 }
 
 func sqliteScalar(dbPath string, query string) (string, error) {
