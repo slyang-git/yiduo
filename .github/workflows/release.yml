@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, darwin]
+        goos: [linux, darwin, windows]
         goarch: [amd64, arm64]
 
     steps:
@@ -31,16 +31,26 @@ jobs:
           mkdir -p dist
           BIN_NAME=yiduo
           VERSION=${{ github.ref_name }}
+          OUTPUT_NAME=${BIN_NAME}
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT_NAME=${BIN_NAME}.exe
+          fi
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "dist/${BIN_NAME}" .
-          tar -czf "dist/${BIN_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C dist "${BIN_NAME}"
-          rm -f "dist/${BIN_NAME}"
+            go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "dist/${OUTPUT_NAME}" .
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cd dist
+            zip -q "${BIN_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" "${OUTPUT_NAME}"
+            rm -f "${OUTPUT_NAME}"
+          else
+            tar -czf "dist/${BIN_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" -C dist "${OUTPUT_NAME}"
+            rm -f "dist/${OUTPUT_NAME}"
+          fi
 
       - name: Upload release archives
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*.tar.gz
+          path: dist/*
           if-no-files-found: error
 
   release:
@@ -57,5 +67,6 @@ jobs:
         with:
           files: |
             dist/**/yiduo_*.tar.gz
+            dist/**/yiduo_*.zip
           fail_on_unmatched_files: true
           tag_name: ${{ github.ref_name }}
