@@ -43,6 +43,11 @@ Git history uses Conventional Commit style (examples: `feat: ...`, `feat(install
   - commands run for verification,
   - any config/env impacts (tokens, server URL, daemon behavior).
 
+## Release Tagging Guidelines
+- Tags follow SemVer with a `v` prefix and are currently incremented as `v0.0.X`.
+- Choose the next tag by incrementing the latest existing tag (for example `v0.0.46` -> `v0.0.47`).
+- Create the tag after committing release changes and push both the commit and tag to `origin`.
+
 ## Security & Configuration Tips
 - Never commit real device tokens or secrets.
 - Prefer environment variables for local credentials when possible.
