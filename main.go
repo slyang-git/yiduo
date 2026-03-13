@@ -21,7 +21,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -671,7 +670,7 @@ func runSyncLoop(runOnce func() (int, error), state *syncState, logFile *os.File
 	defer removeDaemonState()
 
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(quit, daemonSignals()...)
 	defer signal.Stop(quit)
 
 	logDaemonf(logFile, "daemon started")
@@ -838,32 +837,11 @@ func printDaemonStatus() {
 }
 
 func stopDaemon() error {
-	pid, err := readDaemonPid()
-	if err != nil {
-		return err
-	}
-	if pid == 0 {
-		return fmt.Errorf("daemon pid not found")
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		return err
-	}
-	return nil
+	return stopDaemonOS()
 }
 
 func daemonRunning() (bool, int) {
-	pid, err := readDaemonPid()
-	if err != nil || pid == 0 {
-		return false, 0
-	}
-	if err := syscall.Kill(pid, 0); err != nil {
-		return false, 0
-	}
-	return true, pid
+	return daemonRunningOS()
 }
 
 func waitForDaemonStop(timeout time.Duration) error {
@@ -1133,7 +1111,7 @@ func followLog(path string) error {
 	defer ticker.Stop()
 
 	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(stop, daemonSignals()...)
 	defer signal.Stop(stop)
 
 	var offset int64
@@ -6686,18 +6664,7 @@ func detectMemoryTotalMB() int {
 }
 
 func detectDiskFreeGB(path string) int {
-	if strings.TrimSpace(path) == "" {
-		path = "."
-	}
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0
-	}
-	freeBytes := stat.Bavail * uint64(stat.Bsize)
-	if freeBytes == 0 {
-		return 0
-	}
-	return int(freeBytes / 1024 / 1024 / 1024)
+	return detectDiskFreeGBOS(path)
 }
 
 type yiduoConfig struct {
