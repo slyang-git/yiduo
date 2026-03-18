@@ -142,7 +142,7 @@ func main() {
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
-	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi (comma-separated)")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi|warp (comma-separated)")
 	authToken := flag.String("auth-token", "", "auth token for sync authentication")
 	deviceToken := flag.String("device-token", "", "deprecated: use --auth-token")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
@@ -165,6 +165,7 @@ func main() {
 	qoderRoot := flag.String("qoder-root", envOrDefault("QODER_ROOT", "~/.qoder"), "Qoder root")
 	gooseRoot := flag.String("goose-root", envOrDefault("GOOSE_ROOT", "~/.local/share/goose"), "Goose root")
 	kimiRoot := flag.String("kimi-root", envOrDefault("KIMI_ROOT", "~/.kimi"), "Kimi Code root")
+	warpRoot := flag.String("warp-root", envOrDefault("WARP_ROOT", "~/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/dev.warp.Warp-Stable"), "Warp root")
 	agentID := flag.String("agent-id", "local", "agent id")
 	host := flag.String("host", hostname(), "host name")
 	if err := flag.CommandLine.Parse(args); err != nil {
@@ -337,6 +338,7 @@ func main() {
 		qoderRoot:       expandUser(*qoderRoot),
 		gooseRoot:       expandUser(*gooseRoot),
 		kimiRoot:        expandUser(*kimiRoot),
+		warpRoot:        expandUser(*warpRoot),
 		logf:            options.logf,
 	}
 	baseDeviceInfo.SourcesEnabled = detectInstalledSources(baseParams)
@@ -467,6 +469,7 @@ type syncParams struct {
 	qoderRoot       string
 	gooseRoot       string
 	kimiRoot        string
+	warpRoot        string
 	logf            func(format string, args ...any)
 }
 
@@ -536,6 +539,12 @@ func isSourceInstalled(source string, params syncParams) bool {
 		return dirExists(filepath.Join(params.droidRoot, "sessions"))
 	case "qoder":
 		return dirExists(filepath.Join(params.qoderRoot, "projects"))
+	case "goose":
+		return isRegularFile(filepath.Join(params.gooseRoot, "sessions", "sessions.db"))
+	case "kimi":
+		return dirExists(filepath.Join(params.kimiRoot, "sessions"))
+	case "warp":
+		return isRegularFile(filepath.Join(params.warpRoot, "warp.sqlite"))
 	default:
 		return false
 	}
@@ -599,6 +608,8 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			sessions, err = loadGooseSessions(params.gooseRoot)
 		case "kimi":
 			sessions, err = loadKimiSessions(params.kimiRoot)
+		case "warp":
+			sessions, err = loadWarpSessions(params.warpRoot)
 		default:
 			return 0, fmt.Errorf("unknown source: %s", sourceName)
 		}
@@ -4554,6 +4565,187 @@ func loadKimiSessions(root string) ([]SyncSession, error) {
 	return sessions, nil
 }
 
+func loadWarpSessions(root string) ([]SyncSession, error) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return []SyncSession{}, nil
+	}
+	dbPath := filepath.Join(root, "warp.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		return []SyncSession{}, nil
+	}
+
+	queryRows, err := sqliteRows(dbPath, "SELECT exchange_id, conversation_id, start_ts, input, working_directory, model_id FROM ai_queries ORDER BY start_ts ASC")
+	if err != nil {
+		return nil, err
+	}
+
+	sessionByID := make(map[string]*SyncSession, 40)
+	order := make([]string, 0, 40)
+	msgIndexByConv := map[string]int{}
+
+	for _, row := range queryRows {
+		if len(row) < 6 {
+			continue
+		}
+		convID := strings.TrimSpace(row[1])
+		if convID == "" {
+			continue
+		}
+		session, exists := sessionByID[convID]
+		if !exists {
+			session = &SyncSession{ID: convID}
+			sessionByID[convID] = session
+			order = append(order, convID)
+		}
+
+		ts := parseWarpTimestamp(row[2])
+		if session.StartedAt == "" || (ts != "" && ts < session.StartedAt) {
+			session.StartedAt = ts
+		}
+		if session.EndedAt == "" || (ts != "" && ts > session.EndedAt) {
+			session.EndedAt = ts
+		}
+		if session.Cwd == "" {
+			session.Cwd = normalizeCwd(strings.TrimSpace(row[4]))
+		}
+		if session.Model == "" && strings.TrimSpace(row[5]) != "" {
+			session.Model = strings.TrimSpace(row[5])
+		}
+
+		text := parseWarpQueryText(row[3])
+		if text == "" {
+			continue
+		}
+		idx := msgIndexByConv[convID]
+		session.Messages = append(session.Messages, SyncMessage{
+			Index:     idx,
+			Role:      "user",
+			Content:   text,
+			Timestamp: ts,
+		})
+		msgIndexByConv[convID] = idx + 1
+		if session.Title == "" {
+			session.Title = firstLine(text)
+		}
+	}
+
+	// Enrich token totals and model from agent_conversations metadata.
+	convRows, err := sqliteRows(dbPath, "SELECT conversation_id, conversation_data FROM agent_conversations")
+	if err == nil {
+		for _, row := range convRows {
+			if len(row) < 2 {
+				continue
+			}
+			convID := strings.TrimSpace(row[0])
+			session := sessionByID[convID]
+			if session == nil {
+				continue
+			}
+			total, model := parseWarpConversationData(row[1])
+			session.TotalTokens = total
+			if model != "" {
+				session.Model = model
+			}
+		}
+	}
+
+	sessions := make([]SyncSession, 0, len(order))
+	for _, id := range order {
+		session := sessionByID[id]
+		if session == nil || session.ID == "" || len(session.Messages) == 0 {
+			continue
+		}
+		if session.StartedAt == "" {
+			session.StartedAt = session.EndedAt
+		}
+		if session.EndedAt == "" {
+			session.EndedAt = session.StartedAt
+		}
+		sessions = append(sessions, *session)
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt < sessions[j].StartedAt
+	})
+	return sessions, nil
+}
+
+// parseWarpTimestamp converts Warp's SQLite datetime "2025-01-17 02:30:45.987103" to RFC3339.
+func parseWarpTimestamp(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	formats := []string{
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.UTC().Format(time.RFC3339)
+		}
+	}
+	return s
+}
+
+// parseWarpQueryText extracts the user query text from the ai_queries.input JSON array.
+// The array contains entries like {"Query":{"text":"..."}} or {"ActionResult":{...}}.
+func parseWarpQueryText(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(input), &items); err != nil {
+		return ""
+	}
+	var parts []string
+	for _, item := range items {
+		raw, ok := item["Query"]
+		if !ok {
+			continue
+		}
+		var q map[string]string
+		if err := json.Unmarshal(raw, &q); err != nil {
+			continue
+		}
+		if t := strings.TrimSpace(q["text"]); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// parseWarpConversationData extracts total token count and dominant model from conversation_data JSON.
+func parseWarpConversationData(data string) (totalTokens int, model string) {
+	data = strings.TrimSpace(data)
+	if data == "" {
+		return 0, ""
+	}
+	var obj struct {
+		ConversationUsageMetadata struct {
+			TokenUsage []struct {
+				ModelID    string `json:"model_id"`
+				WarpTokens int    `json:"warp_tokens"`
+				ByokTokens int    `json:"byok_tokens"`
+			} `json:"token_usage"`
+		} `json:"conversation_usage_metadata"`
+	}
+	if err := json.Unmarshal([]byte(data), &obj); err != nil {
+		return 0, ""
+	}
+	bestTokens := 0
+	for _, tu := range obj.ConversationUsageMetadata.TokenUsage {
+		tokens := tu.WarpTokens + tu.ByokTokens
+		totalTokens += tokens
+		if tokens > bestTokens {
+			bestTokens = tokens
+			model = tu.ModelID
+		}
+	}
+	return totalTokens, model
+}
+
 func loadKimiWorkDirs(root string) map[string]string {
 	configPath := filepath.Join(root, "kimi.json")
 	raw, err := os.ReadFile(configPath)
@@ -6946,6 +7138,7 @@ func parseSources(value string) ([]string, error) {
 			"qoder",
 			"goose",
 			"kimi",
+			"warp",
 		}, nil
 	}
 	parts := strings.Split(normalized, ",")
@@ -6968,6 +7161,7 @@ func parseSources(value string) ([]string, error) {
 		"qoder":       true,
 		"goose":       true,
 		"kimi":        true,
+		"warp":        true,
 	}
 	seen := map[string]bool{}
 	var sources []string
@@ -6996,6 +7190,7 @@ func parseSources(value string) ([]string, error) {
 				"qoder",
 				"goose",
 				"kimi",
+				"warp",
 			}, nil
 		}
 		if !allowed[source] {
@@ -7050,6 +7245,8 @@ func defaultToolName(source string) string {
 		return "goose"
 	case "kimi":
 		return "kimi-code"
+	case "warp":
+		return "warp"
 	default:
 		return source
 	}
