@@ -7,6 +7,13 @@ Versions follow `v0.0.X` incremental tagging. Update this file when cutting a ne
 
 ---
 
+## [v0.0.52] - 2026-03-18
+
+### Added
+- Warp Terminal AI session integration: reads from `warp.sqlite` (`agent_conversations` + `ai_queries` tables)
+
+---
+
 ## [v0.0.47] - 2026-03-13
 
 ### Fixed
