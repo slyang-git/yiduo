@@ -3501,14 +3501,23 @@ func loadCursorTranscriptSessions(root string, logf func(format string, args ...
 
 	transcriptPaths := make([]string, 0)
 	err = filepath.WalkDir(projectsRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil
+		}
+		slashPath := filepath.ToSlash(path)
+		// Skip the subagents directory entirely — subagent transcripts are not
+		// top-level sessions and should not be reported independently.
+		if d.IsDir() && strings.HasSuffix(slashPath, "/subagents") {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
 			return nil
 		}
 		name := strings.ToLower(d.Name())
 		if !strings.HasSuffix(name, ".txt") && !strings.HasSuffix(name, ".jsonl") {
 			return nil
 		}
-		if !strings.Contains(filepath.ToSlash(path), "/agent-transcripts/") {
+		if !strings.Contains(slashPath, "/agent-transcripts/") {
 			return nil
 		}
 		transcriptPaths = append(transcriptPaths, path)
