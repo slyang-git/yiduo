@@ -819,6 +819,7 @@ func printDaemonStatus() {
 	fmt.Printf("📦 Install path: %s\n", executablePath())
 	fmt.Printf("⚙️  Config path: %s\n", configPath())
 	fmt.Printf("🔄 Last sync: %s\n", lastSyncTimeDisplay())
+	fmt.Printf("⬆️  Update: curl -fsSL https://yiduo.one/install.sh | bash\n")
 	if running, pid := daemonRunning(); running {
 		fmt.Printf("🟢 Daemon: running (pid %d)\n", pid)
 		if startedAt, ok := daemonStartedAt(pid); ok {
