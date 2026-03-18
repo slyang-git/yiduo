@@ -4479,6 +4479,23 @@ type kimiConfig struct {
 	WorkDirs []kimiWorkDirMeta `json:"work_dirs"`
 }
 
+func loadKimiDefaultModel(root string) string {
+	raw, err := os.ReadFile(filepath.Join(root, "config.toml"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "default_model") {
+			continue
+		}
+		if _, after, ok := strings.Cut(line, "="); ok {
+			return strings.Trim(strings.TrimSpace(after), `"'`)
+		}
+	}
+	return ""
+}
+
 func loadKimiSessions(root string) ([]SyncSession, error) {
 	sessionsRoot := filepath.Join(root, "sessions")
 	info, err := os.Stat(sessionsRoot)
@@ -4488,6 +4505,7 @@ func loadKimiSessions(root string) ([]SyncSession, error) {
 
 	workDirsByHash := loadKimiWorkDirs(root)
 	lastHistoryByHash := loadKimiUserHistory(root)
+	defaultModel := loadKimiDefaultModel(root)
 
 	hashEntries, err := os.ReadDir(sessionsRoot)
 	if err != nil {
@@ -4512,6 +4530,9 @@ func loadKimiSessions(root string) ([]SyncSession, error) {
 			sessionPath := filepath.Join(sessionsRoot, hashID, sessionEntry.Name())
 			session, ok := parseKimiSession(sessionPath, workDir, lastHistoryByHash[hashID])
 			if ok {
+				if session.Model == "" && defaultModel != "" {
+					session.Model = defaultModel
+				}
 				sessions = append(sessions, session)
 			}
 		}
