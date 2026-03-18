@@ -56,6 +56,7 @@ type SyncSession struct {
 	Title                  string        `json:"title"`
 	Model                  string        `json:"model"`
 	Cwd                    string        `json:"cwd"`
+	Client                 string        `json:"client,omitempty"`
 	AgentVersion           string        `json:"agent_version,omitempty"`
 	ToolVersion            string        `json:"tool_version,omitempty"`
 	StartedAt              string        `json:"started_at"`
@@ -1185,6 +1186,25 @@ func logDaemonf(file *os.File, format string, args ...any) {
 	fmt.Fprintln(file)
 }
 
+// normalizeCodexClient maps the raw originator string from Codex session_meta
+// to a canonical client name. All sessions remain under the "codex" tool.
+func normalizeCodexClient(originator string) string {
+	switch originator {
+	case "codex_cli_rs":
+		return "cli"
+	case "codex_vscode":
+		return "vscode"
+	case "Codex Desktop":
+		return "desktop"
+	case "codex-tui":
+		return "tui"
+	case "codex_exec":
+		return "exec"
+	default:
+		return originator
+	}
+}
+
 func loadCodexSessions(root string) ([]SyncSession, error) {
 	sessionsDir := filepath.Join(root, "sessions")
 	entries, err := listJSONL(sessionsDir)
@@ -1284,6 +1304,7 @@ func parseCodexSession(filePath string) (SyncSession, bool) {
 				"repo_path",
 				"path",
 			)
+			session.Client = normalizeCodexClient(stringFrom(payload["originator"]))
 		}
 
 		if typeValue == "turn_context" {
