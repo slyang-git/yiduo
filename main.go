@@ -126,6 +126,10 @@ func main() {
 			printDaemonStatus()
 			return
 		}
+		if first == "update" || first == "upgrade" {
+			selfUpdate()
+			return
+		}
 		if helpRequested(first) {
 			printHelp()
 			return
@@ -404,12 +408,15 @@ Usage:
   %s sync [flags]
   %s sync [start|stop|restart|log]
   %s status
+  %s update
   %s [--help|-h|help]
   %s [--version|version]
 
 Commands:
   sync        Run one-off sync, or use sync subcommands
   status      Show daemon status
+  update      Update yiduo to the latest version (alias: upgrade)
+  upgrade     Alias for update
   help        Show this help
   version     Show version
 
@@ -440,7 +447,8 @@ Examples:
   %s sync --source openclaw
   %s sync --daemon
   %s sync log
-`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
+  %s update
+`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
 }
 
 type syncParams struct {
@@ -830,7 +838,7 @@ func printDaemonStatus() {
 	fmt.Printf("📦 Install path: %s\n", executablePath())
 	fmt.Printf("⚙️  Config path: %s\n", configPath())
 	fmt.Printf("🔄 Last sync: %s\n", lastSyncTimeDisplay())
-	fmt.Printf("⬆️  Update: curl -fsSL https://yiduo.one/install.sh | bash\n")
+	fmt.Printf("⬆️  Update: yiduo update\n")
 	if running, pid := daemonRunning(); running {
 		fmt.Printf("🟢 Daemon: running (pid %d)\n", pid)
 		if startedAt, ok := daemonStartedAt(pid); ok {
@@ -846,6 +854,61 @@ func printDaemonStatus() {
 		if startedAt, err := time.Parse(time.RFC3339, meta.StartedAt); err == nil {
 			fmt.Printf("📝 Last started at: %s\n", formatStatusTime(startedAt))
 		}
+	}
+}
+
+func selfUpdate() {
+	fmt.Printf("🔖 Current version: %s\n", version)
+	fmt.Println("⬇️  Downloading latest version...")
+
+	daemonWasRunning := false
+	if running, pid := daemonRunning(); running {
+		fmt.Printf("🛑 Stopping daemon (pid %d)...\n", pid)
+		if err := stopDaemon(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to stop daemon: %v\n", err)
+			os.Exit(1)
+		}
+		if err := waitForDaemonStop(5 * time.Second); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to stop daemon: %v\n", err)
+			os.Exit(1)
+		}
+		daemonWasRunning = true
+	}
+
+	cmd := exec.Command("sh", "-c", "curl -fsSL https://yiduo.one/install.sh | bash")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Update failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("✅ Update complete")
+
+	if daemonWasRunning {
+		fmt.Println("🔄 Restarting daemon with new version...")
+		binPath := executablePath()
+		restartCmd := exec.Command(binPath, "sync", "start")
+		restartCmd.Env = append(os.Environ(), daemonEnv+"=1")
+		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err == nil {
+			restartCmd.Stdin = devNull
+			restartCmd.Stdout = devNull
+			restartCmd.Stderr = devNull
+		}
+		if err := restartCmd.Start(); err != nil {
+			if devNull != nil {
+				_ = devNull.Close()
+			}
+			fmt.Fprintf(os.Stderr, "failed to restart daemon: %v\n", err)
+			os.Exit(1)
+		}
+		_ = writeDaemonPidWith(restartCmd.Process.Pid)
+		_ = restartCmd.Process.Release()
+		if devNull != nil {
+			_ = devNull.Close()
+		}
+		fmt.Println("🟢 Daemon restarted with new version")
 	}
 }
 
