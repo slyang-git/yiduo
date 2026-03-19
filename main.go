@@ -2472,32 +2472,59 @@ func loadClineSessions(root string) ([]SyncSession, error) {
 		return nil, err
 	}
 
+	tasksDir := filepath.Join(root, "data", "tasks")
+
 	var sessions []SyncSession
 	for _, item := range items {
 		id := stringFrom(item["ulid"])
+		taskID := stringFrom(item["id"])
 		if id == "" {
-			id = stringFrom(item["id"])
+			id = taskID
 		}
 		if id == "" {
 			continue
 		}
-		ts := int64From(item["ts"], 0)
-		startedAt := formatMillis(ts)
+		// taskHistory.ts is the last-updated (end) time; start time comes from ui_messages.
+		endedAt := formatMillis(int64From(item["ts"], 0))
+		// Numeric id is the task creation timestamp in ms.
+		startedAt := formatMillis(int64From(taskID, 0))
+		if startedAt == "" {
+			startedAt = endedAt
+		}
+		cacheReads := intFrom(item["cacheReads"], 0)
+		tokensIn := intFrom(item["tokensIn"], 0)
 		session := SyncSession{
-			ID:                     id,
-			Title:                  stringFrom(item["task"]),
-			Cwd:                    stringFrom(item["cwdOnTaskInitialization"]),
+			ID:    id,
+			Title: stringFrom(item["task"]),
+			Model: stringFrom(item["modelId"]),
+			Cwd:   normalizeCwd(stringFrom(item["cwdOnTaskInitialization"])),
+			// Include cacheReads in TotalInputTokens so cache hit rate stays ≤ 100%.
 			StartedAt:              startedAt,
-			EndedAt:                startedAt,
-			TotalInputTokens:       intFrom(item["tokensIn"], 0),
+			EndedAt:                endedAt,
+			TotalInputTokens:       tokensIn + cacheReads,
 			TotalOutputTokens:      intFrom(item["tokensOut"], 0),
-			TotalCachedInputTokens: intFrom(item["cacheReads"], 0),
+			TotalCachedInputTokens: cacheReads,
 		}
 		session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens
 		if session.Title == "" {
 			session.Title = "Cline task"
 		}
-		if session.Title != "" {
+
+		// Load full conversation from ui_messages.json; override timestamps if available.
+		if taskID != "" {
+			uiPath := filepath.Join(tasksDir, taskID, "ui_messages.json")
+			var uiStart, uiEnd string
+			session.Messages, uiStart, uiEnd = parseClineUIMessages(uiPath)
+			if uiStart != "" {
+				session.StartedAt = uiStart
+			}
+			if uiEnd != "" {
+				session.EndedAt = uiEnd
+			}
+		}
+
+		// Fall back to single task message if no ui_messages loaded.
+		if len(session.Messages) == 0 {
 			session.Messages = append(session.Messages, SyncMessage{
 				Index:     0,
 				Role:      "user",
@@ -2505,9 +2532,64 @@ func loadClineSessions(root string) ([]SyncSession, error) {
 				Timestamp: startedAt,
 			})
 		}
+
 		sessions = append(sessions, session)
 	}
 	return sessions, nil
+}
+
+// parseClineUIMessages reads ui_messages.json and extracts user/assistant turns.
+// Returns messages, startedAt (min ts), and endedAt (max ts).
+func parseClineUIMessages(path string) ([]SyncMessage, string, string) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", ""
+	}
+	var msgs []map[string]any
+	if err := json.Unmarshal(raw, &msgs); err != nil {
+		return nil, "", ""
+	}
+
+	var messages []SyncMessage
+	var startedAt, endedAt string
+	idx := 0
+
+	for _, msg := range msgs {
+		ts := formatMillis(int64From(msg["ts"], 0))
+		if ts != "" {
+			if startedAt == "" || ts < startedAt {
+				startedAt = ts
+			}
+			if endedAt == "" || ts > endedAt {
+				endedAt = ts
+			}
+		}
+
+		say := stringFrom(msg["say"])
+		var role, content string
+		switch say {
+		case "task", "user_feedback":
+			role = "user"
+			content = strings.TrimSpace(stringFrom(msg["text"]))
+		case "completion_result":
+			role = "assistant"
+			content = strings.TrimSpace(stringFrom(msg["text"]))
+		default:
+			continue
+		}
+		if content == "" {
+			continue
+		}
+		messages = append(messages, SyncMessage{
+			Index:     idx,
+			Role:      role,
+			Content:   content,
+			Timestamp: ts,
+		})
+		idx++
+	}
+
+	return messages, startedAt, endedAt
 }
 
 func loadContinueSessions(root string) ([]SyncSession, error) {
