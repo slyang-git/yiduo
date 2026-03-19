@@ -72,3 +72,9 @@ Sync a specific source (for example OpenClaw sessions from `~/.openclaw/agents/m
 ```sh
 yiduo sync --source openclaw
 ```
+
+Blackbox Code is also supported and reads from `~/.blackboxcli/` by default:
+
+```sh
+yiduo sync --source blackbox
+```
