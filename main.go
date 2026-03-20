@@ -886,6 +886,10 @@ func selfUpdate() {
 	cmd := exec.Command("sh", "-c", "curl -fsSL https://yiduo.one/install.sh | bash")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	if cfg := loadConfig(); cfg.AuthToken != "" {
+		cmd.Env = append(cmd.Env, "AI_WRAPPED_SYNC_TOKEN="+cfg.AuthToken)
+	}
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Update failed: %v\n", err)
 		os.Exit(1)
