@@ -1,0 +1,8 @@
+{
+  "blackbox": {
+    "label": "Blackbox",
+    "icon": "assets/brands/blackbox.svg",
+    "source_url": "https://docs.blackbox.ai/favicon1.svg",
+    "website": "https://www.blackbox.ai/"
+  }
+}

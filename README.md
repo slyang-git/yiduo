@@ -8,6 +8,7 @@ Project-local tool brand icons live under `assets/brands/`.
 
 - Goose: `assets/brands/goose.png`
 - Kimi Code: `assets/brands/kimi.ico`
+- Blackbox: `assets/brands/blackbox.svg`
 
 Canonical source URLs are recorded in `assets/brands/manifest.json`.
 
