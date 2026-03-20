@@ -146,7 +146,7 @@ func main() {
 
 	server := flag.String("server", "", "API server base URL")
 	tool := flag.String("tool", "", "tool name override")
-	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi|warp|blackbox (comma-separated)")
+	source := flag.String("source", "auto", "data source: auto|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi|warp (comma-separated)")
 	authToken := flag.String("auth-token", "", "auth token for sync authentication")
 	deviceToken := flag.String("device-token", "", "deprecated: use --auth-token")
 	daemon := flag.Bool("daemon", false, "run periodic sync in background")
@@ -170,7 +170,6 @@ func main() {
 	gooseRoot := flag.String("goose-root", envOrDefault("GOOSE_ROOT", "~/.local/share/goose"), "Goose root")
 	kimiRoot := flag.String("kimi-root", envOrDefault("KIMI_ROOT", "~/.kimi"), "Kimi Code root")
 	warpRoot := flag.String("warp-root", envOrDefault("WARP_ROOT", "~/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support/dev.warp.Warp-Stable"), "Warp root")
-	blackboxRoot := flag.String("blackbox-root", envOrDefault("BLACKBOX_ROOT", "~/.blackboxcli"), "Blackbox root")
 	agentID := flag.String("agent-id", "local", "agent id")
 	host := flag.String("host", hostname(), "host name")
 	if err := flag.CommandLine.Parse(args); err != nil {
@@ -344,7 +343,6 @@ func main() {
 		gooseRoot:       expandUser(*gooseRoot),
 		kimiRoot:        expandUser(*kimiRoot),
 		warpRoot:        expandUser(*warpRoot),
-		blackboxRoot:    expandUser(*blackboxRoot),
 		logf:            options.logf,
 	}
 	baseDeviceInfo.SourcesEnabled = detectInstalledSources(baseParams)
@@ -430,7 +428,7 @@ Sync Subcommands:
 
 Key Flags:
  --source string        Data source(s), comma-separated.
-                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi|warp|blackbox
+                         Values: auto|all|codex|claude|gemini|qwen|cline|continue|kilocode|cursor|amp|opencode|pi|openclaw|crush|antigravity|droid|qoder|goose|kimi
   --daemon, -d           Run sync daemon in background
   --server string        API server base URL
   --auth-token string    Sync auth token
@@ -441,7 +439,7 @@ Key Flags:
 Root Path Flags:
   --codex-root --claude-root --gemini-root --qwen-root --cline-root --continue-root
   --kilocode-root --cursor-root --amp-root --opencode-root --pi-root --openclaw-root --crush-root
-  --antigravity-root --droid-root --qoder-root --goose-root --kimi-root --warp-root --blackbox-root
+  --antigravity-root --droid-root --qoder-root --goose-root --kimi-root
 
 Examples:
   %s status
@@ -480,7 +478,6 @@ type syncParams struct {
 	gooseRoot       string
 	kimiRoot        string
 	warpRoot        string
-	blackboxRoot    string
 	logf            func(format string, args ...any)
 }
 
@@ -556,9 +553,6 @@ func isSourceInstalled(source string, params syncParams) bool {
 		return dirExists(filepath.Join(params.kimiRoot, "sessions"))
 	case "warp":
 		return isRegularFile(filepath.Join(params.warpRoot, "warp.sqlite"))
-	case "blackbox":
-		return isRegularFile(filepath.Join(params.blackboxRoot, "stats-history.json")) ||
-			dirExists(filepath.Join(params.blackboxRoot, "tmp"))
 	default:
 		return false
 	}
@@ -624,8 +618,6 @@ func syncOnce(params syncParams, options syncOptions) (int, error) {
 			sessions, err = loadKimiSessions(params.kimiRoot)
 		case "warp":
 			sessions, err = loadWarpSessions(params.warpRoot)
-		case "blackbox":
-			sessions, err = loadBlackboxSessions(params.blackboxRoot)
 		default:
 			return 0, fmt.Errorf("unknown source: %s", sourceName)
 		}
@@ -4806,395 +4798,6 @@ func loadWarpSessions(root string) ([]SyncSession, error) {
 	return sessions, nil
 }
 
-type blackboxStatsHistory struct {
-	Sessions []blackboxStatsSession `json:"sessions"`
-}
-
-type blackboxStatsSession struct {
-	SessionID string `json:"sessionId"`
-	StartTime string `json:"startTime"`
-	EndTime   string `json:"endTime"`
-}
-
-type blackboxSettings struct {
-	Model            string `json:"model"`
-	SelectedAuthType string `json:"selectedAuthType"`
-	Security         struct {
-		Auth struct {
-			SelectedProvider string `json:"selectedProvider"`
-		} `json:"auth"`
-	} `json:"security"`
-}
-
-type blackboxLogEntry struct {
-	SessionID string `json:"sessionId"`
-	MessageID int    `json:"messageId"`
-	Type      string `json:"type"`
-	Message   string `json:"message"`
-	Timestamp string `json:"timestamp"`
-}
-
-func loadBlackboxSessions(root string) ([]SyncSession, error) {
-	if root == "" {
-		return []SyncSession{}, nil
-	}
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
-		return []SyncSession{}, nil
-	}
-
-	settings := loadBlackboxSettings(filepath.Join(root, "settings.json"))
-	statsByID, err := loadBlackboxStats(filepath.Join(root, "stats-history.json"))
-	if err != nil {
-		return nil, err
-	}
-	logsByID, err := loadBlackboxLogs(filepath.Join(root, "tmp"))
-	if err != nil {
-		return nil, err
-	}
-
-	sessionByID := map[string]*SyncSession{}
-	order := make([]string, 0)
-	remember := func(session SyncSession) {
-		if session.ID == "" {
-			return
-		}
-		if existing := sessionByID[session.ID]; existing != nil {
-			mergeBlackboxSession(existing, session)
-			return
-		}
-		copySession := session
-		sessionByID[session.ID] = &copySession
-		order = append(order, session.ID)
-	}
-
-	tmpRoot := filepath.Join(root, "tmp")
-	_ = filepath.WalkDir(tmpRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil || d == nil || d.IsDir() {
-			return nil
-		}
-		if !strings.HasPrefix(d.Name(), "checkpoint-session-") || !strings.HasSuffix(d.Name(), ".json") {
-			return nil
-		}
-		session, ok := parseBlackboxCheckpoint(path, logsByID, statsByID, settings)
-		if ok {
-			remember(session)
-		}
-		return nil
-	})
-
-	for sessionID, entries := range logsByID {
-		if sessionByID[sessionID] != nil {
-			continue
-		}
-		session, ok := buildBlackboxSessionFromLogs(sessionID, entries, statsByID[sessionID], settings)
-		if ok {
-			remember(session)
-		}
-	}
-
-	sessions := make([]SyncSession, 0, len(order))
-	for _, id := range order {
-		session := sessionByID[id]
-		if session == nil || session.ID == "" {
-			continue
-		}
-		finalizeBlackboxSession(session, statsByID[id], settings)
-		if len(session.Messages) == 0 {
-			continue
-		}
-		sessions = append(sessions, *session)
-	}
-
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].StartedAt < sessions[j].StartedAt
-	})
-	return sessions, nil
-}
-
-func loadBlackboxSettings(path string) blackboxSettings {
-	settings := blackboxSettings{}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return settings
-	}
-	_ = json.Unmarshal(raw, &settings)
-	return settings
-}
-
-func loadBlackboxStats(path string) (map[string]blackboxStatsSession, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string]blackboxStatsSession{}, nil
-		}
-		return nil, err
-	}
-	var history blackboxStatsHistory
-	if err := json.Unmarshal(raw, &history); err != nil {
-		return nil, err
-	}
-	result := make(map[string]blackboxStatsSession, len(history.Sessions))
-	for _, item := range history.Sessions {
-		sessionID := strings.TrimSpace(item.SessionID)
-		if sessionID == "" {
-			continue
-		}
-		result[sessionID] = item
-	}
-	return result, nil
-}
-
-func loadBlackboxLogs(tmpRoot string) (map[string][]blackboxLogEntry, error) {
-	result := map[string][]blackboxLogEntry{}
-	if !dirExists(tmpRoot) {
-		return result, nil
-	}
-	err := filepath.WalkDir(tmpRoot, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil || d == nil || d.IsDir() || d.Name() != "logs.json" {
-			return nil
-		}
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		var entries []blackboxLogEntry
-		if err := json.Unmarshal(raw, &entries); err != nil {
-			return nil
-		}
-		for _, entry := range entries {
-			sessionID := strings.TrimSpace(entry.SessionID)
-			if sessionID == "" {
-				continue
-			}
-			result[sessionID] = append(result[sessionID], entry)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	for sessionID := range result {
-		sort.Slice(result[sessionID], func(i, j int) bool {
-			left := result[sessionID][i]
-			right := result[sessionID][j]
-			if left.MessageID != right.MessageID {
-				return left.MessageID < right.MessageID
-			}
-			return left.Timestamp < right.Timestamp
-		})
-	}
-	return result, nil
-}
-
-func parseBlackboxCheckpoint(path string, logsByID map[string][]blackboxLogEntry, statsByID map[string]blackboxStatsSession, settings blackboxSettings) (SyncSession, bool) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return SyncSession{}, false
-	}
-	var items []map[string]any
-	if err := json.Unmarshal(raw, &items); err != nil {
-		return SyncSession{}, false
-	}
-
-	sessionID := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), "checkpoint-session-"), ".json"))
-	session := SyncSession{
-		ID:    sessionID,
-		Model: strings.TrimSpace(settings.Model),
-	}
-	if stat, err := os.Stat(path); err == nil {
-		session.EndedAt = stat.ModTime().UTC().Format(time.RFC3339)
-	}
-
-	userLogs := blackboxUserLogs(logsByID[sessionID])
-	userLogIndex := 0
-	for _, item := range items {
-		role := normalizeBlackboxRole(stringFrom(item["role"]))
-		content := parseBlackboxParts(item["parts"])
-		if role == "" || content == "" {
-			continue
-		}
-		msg := SyncMessage{
-			Index:   len(session.Messages),
-			Role:    role,
-			Content: content,
-		}
-		if role == "user" {
-			if userLogIndex < len(userLogs) && strings.TrimSpace(userLogs[userLogIndex].Message) == strings.TrimSpace(content) {
-				msg.Timestamp = normalizeBlackboxTimestamp(userLogs[userLogIndex].Timestamp)
-				userLogIndex++
-			}
-			if session.Title == "" && !strings.HasPrefix(strings.TrimSpace(content), "This is the Blackbox Code.") {
-				session.Title = firstLine(content)
-			}
-		}
-		session.Messages = append(session.Messages, msg)
-	}
-	if session.ID == "" {
-		return SyncSession{}, false
-	}
-	finalizeBlackboxSession(&session, statsByID[session.ID], settings)
-	return session, len(session.Messages) > 0
-}
-
-func buildBlackboxSessionFromLogs(sessionID string, entries []blackboxLogEntry, stats blackboxStatsSession, settings blackboxSettings) (SyncSession, bool) {
-	session := SyncSession{
-		ID:    strings.TrimSpace(sessionID),
-		Model: strings.TrimSpace(settings.Model),
-	}
-	for _, entry := range entries {
-		content := strings.TrimSpace(entry.Message)
-		if content == "" {
-			continue
-		}
-		msg := SyncMessage{
-			Index:     len(session.Messages),
-			Role:      normalizeBlackboxRole(entry.Type),
-			Content:   content,
-			Timestamp: normalizeBlackboxTimestamp(entry.Timestamp),
-		}
-		if msg.Role == "" {
-			msg.Role = "user"
-		}
-		session.Messages = append(session.Messages, msg)
-		if session.Title == "" && msg.Role == "user" && !strings.HasPrefix(content, "/") {
-			session.Title = firstLine(content)
-		}
-	}
-	finalizeBlackboxSession(&session, stats, settings)
-	return session, session.ID != "" && len(session.Messages) > 0
-}
-
-func mergeBlackboxSession(dst *SyncSession, src SyncSession) {
-	if dst.Title == "" {
-		dst.Title = src.Title
-	}
-	if dst.Model == "" {
-		dst.Model = src.Model
-	}
-	if dst.Cwd == "" {
-		dst.Cwd = src.Cwd
-	}
-	if dst.StartedAt == "" || (src.StartedAt != "" && src.StartedAt < dst.StartedAt) {
-		dst.StartedAt = src.StartedAt
-	}
-	if dst.EndedAt == "" || src.EndedAt > dst.EndedAt {
-		dst.EndedAt = src.EndedAt
-	}
-	if len(dst.Messages) == 0 && len(src.Messages) > 0 {
-		dst.Messages = src.Messages
-	}
-}
-
-func finalizeBlackboxSession(session *SyncSession, stats blackboxStatsSession, settings blackboxSettings) {
-	if session == nil {
-		return
-	}
-	if session.Model == "" {
-		session.Model = strings.TrimSpace(settings.Model)
-	}
-	if session.StartedAt == "" {
-		session.StartedAt = normalizeBlackboxTimestamp(stats.StartTime)
-	}
-	if session.EndedAt == "" {
-		session.EndedAt = normalizeBlackboxTimestamp(stats.EndTime)
-	}
-	for i := range session.Messages {
-		msg := &session.Messages[i]
-		if msg.Timestamp != "" && (session.StartedAt == "" || msg.Timestamp < session.StartedAt) {
-			session.StartedAt = msg.Timestamp
-		}
-		if msg.Timestamp != "" && (session.EndedAt == "" || msg.Timestamp > session.EndedAt) {
-			session.EndedAt = msg.Timestamp
-		}
-		if session.Title == "" && msg.Role == "user" && !strings.HasPrefix(strings.TrimSpace(msg.Content), "This is the Blackbox Code.") {
-			session.Title = firstLine(msg.Content)
-		}
-	}
-	if session.StartedAt == "" {
-		session.StartedAt = session.EndedAt
-	}
-	if session.EndedAt == "" {
-		session.EndedAt = session.StartedAt
-	}
-	session.Cwd = normalizeCwd(session.Cwd)
-	if session.Title == "" {
-		if session.Cwd != "" {
-			session.Title = session.Cwd
-		} else {
-			session.Title = "Blackbox session"
-		}
-	}
-}
-
-func blackboxUserLogs(entries []blackboxLogEntry) []blackboxLogEntry {
-	filtered := make([]blackboxLogEntry, 0, len(entries))
-	for _, entry := range entries {
-		if normalizeBlackboxRole(entry.Type) != "user" {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	return filtered
-}
-
-func normalizeBlackboxRole(value string) string {
-	switch strings.TrimSpace(strings.ToLower(value)) {
-	case "user":
-		return "user"
-	case "model", "assistant":
-		return "assistant"
-	default:
-		return ""
-	}
-}
-
-func normalizeBlackboxTimestamp(value string) string {
-	trimmed := strings.TrimSpace(value)
-	if trimmed == "" {
-		return ""
-	}
-	if ts, err := time.Parse(time.RFC3339, trimmed); err == nil {
-		return ts.UTC().Format(time.RFC3339)
-	}
-	return ""
-}
-
-func parseBlackboxParts(value any) string {
-	items, ok := value.([]any)
-	if !ok {
-		return ""
-	}
-	parts := make([]string, 0, len(items))
-	for _, item := range items {
-		entry := mapFrom(item)
-		if text := strings.TrimSpace(stringFrom(entry["text"])); text != "" {
-			parts = append(parts, text)
-			continue
-		}
-		if fn := mapFrom(entry["functionCall"]); len(fn) > 0 {
-			name := strings.TrimSpace(stringFrom(fn["name"]))
-			argsText := stringifyJSON(fn["args"])
-			if argsText == "" {
-				parts = append(parts, fmt.Sprintf("[tool_use] %s", firstNonEmpty(name, "tool")))
-			} else {
-				parts = append(parts, fmt.Sprintf("[tool_use] %s\n%s", firstNonEmpty(name, "tool"), argsText))
-			}
-			continue
-		}
-		if fn := mapFrom(entry["functionResponse"]); len(fn) > 0 {
-			name := strings.TrimSpace(stringFrom(fn["name"]))
-			responseText := stringifyJSON(fn["response"])
-			if responseText == "" {
-				parts = append(parts, fmt.Sprintf("[tool_result] %s", firstNonEmpty(name, "tool")))
-			} else {
-				parts = append(parts, fmt.Sprintf("[tool_result] %s\n%s", firstNonEmpty(name, "tool"), responseText))
-			}
-		}
-	}
-	return strings.TrimSpace(strings.Join(parts, "\n"))
-}
-
 // parseWarpTimestamp converts Warp's SQLite datetime "2025-01-17 02:30:45.987103" to RFC3339.
 func parseWarpTimestamp(s string) string {
 	s = strings.TrimSpace(s)
@@ -7664,7 +7267,6 @@ func parseSources(value string) ([]string, error) {
 			"goose",
 			"kimi",
 			"warp",
-			"blackbox",
 		}, nil
 	}
 	parts := strings.Split(normalized, ",")
@@ -7688,7 +7290,6 @@ func parseSources(value string) ([]string, error) {
 		"goose":       true,
 		"kimi":        true,
 		"warp":        true,
-		"blackbox":    true,
 	}
 	seen := map[string]bool{}
 	var sources []string
@@ -7718,7 +7319,6 @@ func parseSources(value string) ([]string, error) {
 				"goose",
 				"kimi",
 				"warp",
-				"blackbox",
 			}, nil
 		}
 		if !allowed[source] {
@@ -7775,8 +7375,6 @@ func defaultToolName(source string) string {
 		return "kimi-code"
 	case "warp":
 		return "warp"
-	case "blackbox":
-		return "blackbox"
 	default:
 		return source
 	}
