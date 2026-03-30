@@ -5349,6 +5349,7 @@ func parseKimiSession(sessionPath string, workDir string, historyFallback string
 
 	var startedAt time.Time
 	var endedAt time.Time
+	updateTimeBoundsWithTime(&startedAt, &endedAt, statModTime(sessionPath))
 	msgIndex := 0
 	pendingToolArgs := map[string]string{}
 	currentAssistantParts := make([]string, 0)
@@ -5371,6 +5372,7 @@ func parseKimiSession(sessionPath string, workDir string, historyFallback string
 	}
 
 	if file, err := os.Open(wirePath); err == nil {
+		updateTimeBoundsWithTime(&startedAt, &endedAt, statModTime(wirePath))
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 		for scanner.Scan() {
@@ -5498,7 +5500,9 @@ func parseKimiSession(sessionPath string, workDir string, historyFallback string
 				}
 			case "StatusUpdate":
 				accumulateKimiUsage(usageByMessageID, payload)
-			case "TurnEnd", "StepInterrupted":
+			case "StepBegin":
+				flushAssistant(timestamp)
+			case "TurnEnd", "StepEnd", "StepInterrupted":
 				flushAssistant(timestamp)
 			}
 		}
@@ -5511,6 +5515,7 @@ func parseKimiSession(sessionPath string, workDir string, historyFallback string
 	}
 
 	if len(session.Messages) == 0 {
+		updateTimeBoundsWithTime(&startedAt, &endedAt, statModTime(contextPath))
 		parseKimiContextFallback(contextPath, &session, &msgIndex, &startedAt, &endedAt)
 	}
 
@@ -5831,6 +5836,26 @@ func updateTimeBounds(startedAt *time.Time, endedAt *time.Time, timestamp string
 	if endedAt.IsZero() || ts.After(*endedAt) {
 		*endedAt = ts
 	}
+}
+
+func updateTimeBoundsWithTime(startedAt *time.Time, endedAt *time.Time, ts time.Time) {
+	if ts.IsZero() {
+		return
+	}
+	if startedAt.IsZero() || ts.Before(*startedAt) {
+		*startedAt = ts
+	}
+	if endedAt.IsZero() || ts.After(*endedAt) {
+		*endedAt = ts
+	}
+}
+
+func statModTime(path string) time.Time {
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime().UTC()
 }
 
 func kimiWorkDirHash(path string) string {
