@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1355,7 +1356,10 @@ func parseCodexSession(filePath string) (SyncSession, bool) {
 	session.EndedAt = endedAt
 
 	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Codex sessions can contain large single-line payloads such as encrypted reasoning
+	// blocks or rich tool outputs. Keep the scanner limit well above those lines so
+	// token_count events later in the file are still parsed.
+	scanner.Buffer(make([]byte, 0, 256*1024), 16*1024*1024)
 	lineIndex := 0
 	msgIndex := 0
 	var tokens tokenTotals
@@ -1407,11 +1411,22 @@ func parseCodexSession(filePath string) (SyncSession, bool) {
 			if stringFrom(payload["type"]) == "token_count" {
 				info := mapFrom(payload["info"])
 				total := mapFrom(info["total_token_usage"])
-				tokens.totalTokens = intFrom(total["total_tokens"], tokens.totalTokens)
-				tokens.inputTokens = intFrom(total["input_tokens"], tokens.inputTokens)
-				tokens.outputTokens = intFrom(total["output_tokens"], tokens.outputTokens)
-				tokens.cachedInputTokens = intFrom(total["cached_input_tokens"], tokens.cachedInputTokens)
-				tokens.reasoningOutputTokens = intFrom(total["reasoning_output_tokens"], tokens.reasoningOutputTokens)
+				rawInputTokens := intFrom(total["input_tokens"], tokens.inputTokens+tokens.cachedInputTokens)
+				cachedInputTokens := intFrom(total["cached_input_tokens"], tokens.cachedInputTokens)
+				outputTokens := intFrom(total["output_tokens"], tokens.outputTokens)
+				reasoningOutputTokens := intFrom(total["reasoning_output_tokens"], tokens.reasoningOutputTokens)
+				nonCachedInputTokens := rawInputTokens - cachedInputTokens
+				if nonCachedInputTokens < 0 {
+					nonCachedInputTokens = 0
+				}
+				// Match Codex CLI's exit summary:
+				// total = non-cached input + output
+				// cached and reasoning stay as separate dimensions.
+				tokens.inputTokens = nonCachedInputTokens
+				tokens.outputTokens = outputTokens
+				tokens.cachedInputTokens = cachedInputTokens
+				tokens.reasoningOutputTokens = reasoningOutputTokens
+				tokens.totalTokens = nonCachedInputTokens + outputTokens
 			}
 			lineIndex++
 			continue
@@ -1435,6 +1450,9 @@ func parseCodexSession(filePath string) (SyncSession, bool) {
 			}
 		}
 		lineIndex++
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("codex session parse warning: %s: %v", filePath, err)
 	}
 
 	session.TotalTokens = tokens.totalTokens
@@ -3956,7 +3974,10 @@ func parseCursorChatStore(dbPath string, logf func(format string, args ...any)) 
 	logCursorf(logf, "cursor: chat message blobs decoded=%d", len(messageByID))
 
 	startedAt := formatMillis(meta.CreatedAt)
-	endedAt := latestFileTimestamp(dbPath, dbPath+"-shm", dbPath+"-wal")
+	// Exclude the SQLite shared-memory sidecar. Cursor touches *.db-shm while
+	// opening historical chats, which would incorrectly make old chats appear
+	// "ended" at the current sync time.
+	endedAt := latestFileTimestamp(dbPath, dbPath+"-wal")
 	if startedAt == "" {
 		startedAt = endedAt
 	}
