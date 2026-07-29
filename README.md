@@ -68,6 +68,36 @@ yiduo sync restart
 yiduo sync log
 ```
 
+## Skill Backup and Restore
+
+Back up personal, user-level agent skills from supported tools. Shared or
+symlinked skill directories are uploaded only once while each tool binding is
+preserved.
+
+```sh
+yiduo skills sync
+```
+
+On a new device, install the latest immutable snapshot without overwriting
+unmanaged local conflicts:
+
+```sh
+yiduo skills restore
+```
+
+Inspect the local and remote state with:
+
+```sh
+yiduo skills status
+yiduo skills list
+yiduo skills diff
+```
+
+Only personal global skill directories are included. Project, bundled, admin,
+plugin-cache, secret, and special files are excluded. Daemon mode backs up
+local changes after a five-minute debounce; remote changes are pulled only by
+an explicit `skills pull` or `skills restore` command.
+
 Sync a specific source (for example OpenClaw sessions from `~/.openclaw/agents/main/sessions`):
 
 ```sh

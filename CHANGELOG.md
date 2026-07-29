@@ -7,6 +7,14 @@ Versions follow `v0.0.X` incremental tagging. Update this file when cutting a ne
 
 ---
 
+## [v0.0.56] - 2026-07-29
+
+### Added
+- Added encrypted personal skill backup and restore commands with cross-tool symlink deduplication.
+- Added conflict-safe atomic installation, content validation, secret filtering, and daemon backup debounce.
+
+---
+
 ## [v0.0.52] - 2026-03-18
 
 ### Added

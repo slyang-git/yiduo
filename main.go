@@ -119,6 +119,9 @@ func main() {
 	}
 	if len(args) > 0 {
 		first := strings.TrimSpace(args[0])
+		if first == "skills" {
+			os.Exit(runSkillsCommand(args[1:]))
+		}
 		if first == "version" || first == "--version" || first == "-version" {
 			fmt.Println(version)
 			return
@@ -362,7 +365,11 @@ func main() {
 		params := baseParams
 		params.deviceInfo = deviceInfo
 		params.logf = options.logf
-		return syncOnce(params, options)
+		total, err := syncOnce(params, options)
+		if err == nil && daemonWorker && options.logf != nil {
+			maybeAutoBackupSkills(resolvedServer, resolvedDeviceToken, config.DeviceID, options.logf)
+		}
+		return total, err
 	}
 
 	if daemonWorker {
@@ -411,6 +418,7 @@ Usage:
   %s sync [flags]
   %s sync [start|stop|restart|log]
   %s status
+  %s skills [status|list|diff|sync|push|pull|restore]
   %s update
   %s [--help|-h|help]
   %s [--version|version]
@@ -418,6 +426,7 @@ Usage:
 Commands:
   sync        Run one-off sync, or use sync subcommands
   status      Show daemon status
+  skills      Back up and restore user-level agent skills
   update      Update yiduo to the latest version (alias: upgrade)
   upgrade     Alias for update
   help        Show this help
@@ -451,7 +460,7 @@ Examples:
   %s sync --daemon
   %s sync log
   %s update
-`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
+`, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin, bin)
 }
 
 type syncParams struct {
