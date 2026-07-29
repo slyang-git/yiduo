@@ -7,6 +7,14 @@ Versions follow `v0.0.X` incremental tagging. Update this file when cutting a ne
 
 ---
 
+## [v0.0.57] - 2026-07-29
+
+### Fixed
+- Passed the saved auth token through the canonical installer during self-update.
+- Restored a previously running daemon when an update fails.
+
+---
+
 ## [v0.0.56] - 2026-07-29
 
 ### Added

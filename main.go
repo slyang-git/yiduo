@@ -898,9 +898,14 @@ func selfUpdate() {
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 	if cfg := loadConfig(); cfg.AuthToken != "" {
-		cmd.Env = append(cmd.Env, "AI_WRAPPED_SYNC_TOKEN="+cfg.AuthToken)
+		cmd.Env = append(cmd.Env, "YIDUO_TOKEN="+cfg.AuthToken, "AI_WRAPPED_SYNC_TOKEN="+cfg.AuthToken)
 	}
 	if err := cmd.Run(); err != nil {
+		if daemonWasRunning {
+			if restartErr := startDaemonAfterUpdate(); restartErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to restore daemon after update failure: %v\n", restartErr)
+			}
+		}
 		fmt.Fprintf(os.Stderr, "❌ Update failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -909,29 +914,35 @@ func selfUpdate() {
 
 	if daemonWasRunning {
 		fmt.Println("🔄 Restarting daemon with new version...")
-		binPath := executablePath()
-		restartCmd := exec.Command(binPath, "sync", "start")
-		restartCmd.Env = append(os.Environ(), daemonEnv+"=1")
-		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-		if err == nil {
-			restartCmd.Stdin = devNull
-			restartCmd.Stdout = devNull
-			restartCmd.Stderr = devNull
-		}
-		if err := restartCmd.Start(); err != nil {
-			if devNull != nil {
-				_ = devNull.Close()
-			}
+		if err := startDaemonAfterUpdate(); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to restart daemon: %v\n", err)
 			os.Exit(1)
 		}
-		_ = writeDaemonPidWith(restartCmd.Process.Pid)
-		_ = restartCmd.Process.Release()
+		fmt.Println("🟢 Daemon restarted with new version")
+	}
+}
+
+func startDaemonAfterUpdate() error {
+	restartCmd := exec.Command(executablePath(), "sync", "start")
+	restartCmd.Env = append(os.Environ(), daemonEnv+"=1")
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err == nil {
+		restartCmd.Stdin = devNull
+		restartCmd.Stdout = devNull
+		restartCmd.Stderr = devNull
+	}
+	if err := restartCmd.Start(); err != nil {
 		if devNull != nil {
 			_ = devNull.Close()
 		}
-		fmt.Println("🟢 Daemon restarted with new version")
+		return err
 	}
+	_ = writeDaemonPidWith(restartCmd.Process.Pid)
+	_ = restartCmd.Process.Release()
+	if devNull != nil {
+		_ = devNull.Close()
+	}
+	return nil
 }
 
 func stopDaemon() error {
