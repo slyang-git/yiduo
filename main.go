@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -67,7 +68,34 @@ type SyncSession struct {
 	TotalOutputTokens      int           `json:"total_output_tokens"`
 	TotalCachedInputTokens int           `json:"total_cached_input_tokens"`
 	TotalReasoningTokens   int           `json:"total_reasoning_tokens"`
+	Qoder                  *QoderMetrics `json:"qoder,omitempty"`
 	Messages               []SyncMessage `json:"messages"`
+}
+
+type QoderMetrics struct {
+	Credits                float64        `json:"credits,omitempty"`
+	OriginalCredits        float64        `json:"original_credits,omitempty"`
+	BillableRequests       int            `json:"billable_requests,omitempty"`
+	ModelCalls             int            `json:"model_calls,omitempty"`
+	ContextRatioLast       float64        `json:"context_ratio_last,omitempty"`
+	ContextRatioPeak       float64        `json:"context_ratio_peak,omitempty"`
+	ContextRatioAvg        float64        `json:"context_ratio_avg,omitempty"`
+	ContextWindow          int            `json:"context_window,omitempty"`
+	EstimatedContextTokens int            `json:"estimated_context_tokens,omitempty"`
+	PermissionRequests     int            `json:"permission_requests,omitempty"`
+	PermissionAllowed      int            `json:"permission_allowed,omitempty"`
+	PermissionDenied       int            `json:"permission_denied,omitempty"`
+	PermissionSources      map[string]int `json:"permission_sources,omitempty"`
+	PermissionModes        []string       `json:"permission_modes,omitempty"`
+	ToolSuccess            int            `json:"tool_success,omitempty"`
+	ToolErrors             int            `json:"tool_errors,omitempty"`
+	ToolDenied             int            `json:"tool_denied,omitempty"`
+	ShellFailures          int            `json:"shell_failures,omitempty"`
+	ShellAborted           int            `json:"shell_aborted,omitempty"`
+	Turns                  int            `json:"turns,omitempty"`
+	TurnsAborted           int            `json:"turns_aborted,omitempty"`
+	Compactions            int            `json:"compactions,omitempty"`
+	Subagents              int            `json:"subagents,omitempty"`
 }
 
 type SyncMessage struct {
@@ -6982,12 +7010,182 @@ type qoderSessionMeta struct {
 	TotalCachedTokens    int    `json:"total_cached_tokens"`
 }
 
+const qoderDefaultContextWindow = 180000
+
+type qoderRuntimeStats struct {
+	permissionRequests int
+	permissionAllowed  int
+	permissionDenied   int
+	permissionSources  map[string]int
+	toolSuccess        int
+	toolErrors         int
+	toolDenied         int
+	shellFailures      int
+	shellAborted       int
+	turns              int
+	turnsAborted       int
+	compactions        int
+	subagents          int
+}
+
+func (s *qoderRuntimeStats) hasAny() bool {
+	if s == nil {
+		return false
+	}
+	return s.permissionRequests > 0 ||
+		s.permissionAllowed > 0 ||
+		s.permissionDenied > 0 ||
+		s.toolSuccess > 0 ||
+		s.toolErrors > 0 ||
+		s.toolDenied > 0 ||
+		s.shellFailures > 0 ||
+		s.shellAborted > 0 ||
+		s.turns > 0 ||
+		s.turnsAborted > 0 ||
+		s.compactions > 0 ||
+		s.subagents > 0
+}
+
+type qoderModelsConfig struct {
+	Assistant []struct {
+		MaxInputTokens int  `json:"max_input_tokens"`
+		IsDefault      bool `json:"is_default"`
+	} `json:"assistant"`
+}
+
+func qoderContextWindow(root string) int {
+	raw, err := os.ReadFile(filepath.Join(root, ".auth", "models"))
+	if err != nil {
+		return qoderDefaultContextWindow
+	}
+	var config qoderModelsConfig
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return qoderDefaultContextWindow
+	}
+	fallback := 0
+	for _, model := range config.Assistant {
+		if model.MaxInputTokens <= 0 {
+			continue
+		}
+		if model.IsDefault {
+			return model.MaxInputTokens
+		}
+		if model.MaxInputTokens > fallback {
+			fallback = model.MaxInputTokens
+		}
+	}
+	if fallback > 0 {
+		return fallback
+	}
+	return qoderDefaultContextWindow
+}
+
+func loadQoderRuntimeStats(root string) map[string]*qoderRuntimeStats {
+	statsBySession := map[string]*qoderRuntimeStats{}
+	sessionsRoot := filepath.Join(root, "logs", "sessions")
+	info, err := os.Stat(sessionsRoot)
+	if err != nil || !info.IsDir() {
+		return statsBySession
+	}
+	_ = filepath.WalkDir(sessionsRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".jsonl") || filepath.Base(filepath.Dir(path)) != "segments" {
+			return nil
+		}
+		sessionID := filepath.Base(filepath.Dir(filepath.Dir(path)))
+		if sessionID == "" {
+			return nil
+		}
+		stats := statsBySession[sessionID]
+		if stats == nil {
+			stats = &qoderRuntimeStats{permissionSources: map[string]int{}}
+			statsBySession[sessionID] = stats
+		}
+		parseQoderRuntimeFile(path, stats)
+		return nil
+	})
+	return statsBySession
+}
+
+func parseQoderRuntimeFile(path string, stats *qoderRuntimeStats) {
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		item := map[string]any{}
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&item); err != nil {
+			continue
+		}
+		data := mapFrom(item["data"])
+		switch strings.TrimSpace(stringFrom(item["type"])) {
+		case "permission.requested":
+			stats.permissionRequests++
+		case "permission.resolved":
+			if boolFrom(data["allowed"]) {
+				stats.permissionAllowed++
+			} else {
+				stats.permissionDenied++
+			}
+			if source := strings.TrimSpace(stringFrom(data["source"])); source != "" {
+				if stats.permissionSources == nil {
+					stats.permissionSources = map[string]int{}
+				}
+				stats.permissionSources[source]++
+			}
+		case "tool.execution.finished":
+			switch strings.ToLower(strings.TrimSpace(stringFrom(data["status"]))) {
+			case "success":
+				stats.toolSuccess++
+			case "denied":
+				stats.toolDenied++
+			default:
+				stats.toolErrors++
+			}
+		case "tool.shell.finished":
+			if intFrom(data["exit_code"], 0) != 0 {
+				stats.shellFailures++
+			}
+			if boolFrom(data["aborted"]) {
+				stats.shellAborted++
+			}
+		case "turn.started":
+			stats.turns++
+		case "turn.finished":
+			if strings.EqualFold(stringFrom(data["reason"]), "abort") {
+				stats.turnsAborted++
+			}
+		case "compression.progress":
+			if strings.EqualFold(stringFrom(data["stage"]), "starting") {
+				stats.compactions++
+			}
+		case "fork.agent.started":
+			stats.subagents++
+		}
+	}
+}
+
 func loadQoderSessions(root string) ([]SyncSession, error) {
 	projectsDir := filepath.Join(root, "projects")
 	info, err := os.Stat(projectsDir)
 	if err != nil || !info.IsDir() {
 		return []SyncSession{}, nil
 	}
+
+	runtimeStats := loadQoderRuntimeStats(root)
+	contextWindow := qoderContextWindow(root)
 
 	var sessions []SyncSession
 	err = filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
@@ -6997,7 +7195,7 @@ func loadQoderSessions(root string) ([]SyncSession, error) {
 		if !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
-		session, ok := parseQoderSession(path)
+		session, ok := parseQoderSession(path, runtimeStats, contextWindow)
 		if ok {
 			sessions = append(sessions, session)
 		}
@@ -7009,7 +7207,7 @@ func loadQoderSessions(root string) ([]SyncSession, error) {
 	return sessions, nil
 }
 
-func parseQoderSession(path string) (SyncSession, bool) {
+func parseQoderSession(path string, runtimeStats map[string]*qoderRuntimeStats, contextWindow int) (SyncSession, bool) {
 	var meta qoderSessionMeta
 	metaPath := strings.TrimSuffix(path, ".jsonl") + "-session.json"
 	if raw, err := os.ReadFile(metaPath); err == nil {
@@ -7045,6 +7243,15 @@ func parseQoderSession(path string) (SyncSession, bool) {
 	totalInputTokens := 0
 	totalOutputTokens := 0
 	totalCachedTokens := 0
+	qoderCredits := 0.0
+	qoderOriginalCredits := 0.0
+	qoderBillableRequests := 0
+	qoderModelCalls := 0
+	qoderContextLast := 0.0
+	qoderContextPeak := 0.0
+	qoderContextSum := 0.0
+	qoderContextCount := 0
+	qoderPermissionModes := map[string]bool{}
 
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -7084,12 +7291,35 @@ func parseQoderSession(path string) (SyncSession, bool) {
 
 		messageObj := mapFrom(item["message"])
 		role := resolveQoderRole(item, messageObj)
+		usage := mapFrom(messageObj["usage"])
+		credits := floatFrom(usage["credits"], 0)
+		originalCredits := floatFrom(usage["original_credits"], 0)
+		contextRatio := floatFrom(usage["context_usage_ratio"], 0)
+		if credits != 0 || originalCredits != 0 || contextRatio > 0 {
+			qoderModelCalls++
+			qoderCredits += credits
+			qoderOriginalCredits += originalCredits
+			if boolFrom(usage["billable"]) {
+				qoderBillableRequests++
+			}
+			if contextRatio > 0 {
+				qoderContextCount++
+				qoderContextSum += contextRatio
+				qoderContextLast = contextRatio
+				if contextRatio > qoderContextPeak {
+					qoderContextPeak = contextRatio
+				}
+			}
+		}
+		if mode := strings.TrimSpace(stringFrom(item["permissionMode"])); mode != "" {
+			qoderPermissionModes[mode] = true
+		}
+
 		content := parseQoderContent(messageObj["content"])
 		if content == "" {
 			continue
 		}
 
-		usage := mapFrom(messageObj["usage"])
 		inputTokens := intFrom(usage["input_tokens"], 0)
 		outputTokens := intFrom(usage["output_tokens"], 0)
 		cachedTokens := intFrom(usage["cache_read_input_tokens"], 0) + intFrom(usage["cache_creation_input_tokens"], 0)
@@ -7144,6 +7374,50 @@ func parseQoderSession(path string) (SyncSession, bool) {
 		session.TotalCachedInputTokens = totalCachedTokens
 	}
 	session.TotalTokens = session.TotalInputTokens + session.TotalOutputTokens + session.TotalCachedInputTokens
+
+	permissionModes := make([]string, 0, len(qoderPermissionModes))
+	for mode := range qoderPermissionModes {
+		permissionModes = append(permissionModes, mode)
+	}
+	sort.Strings(permissionModes)
+
+	stats := runtimeStats[session.ID]
+	if qoderModelCalls > 0 || qoderContextCount > 0 || len(permissionModes) > 0 || stats.hasAny() {
+		metrics := &QoderMetrics{
+			Credits:          qoderCredits,
+			OriginalCredits:  qoderOriginalCredits,
+			BillableRequests: qoderBillableRequests,
+			ModelCalls:       qoderModelCalls,
+			ContextRatioLast: qoderContextLast,
+			ContextRatioPeak: qoderContextPeak,
+			ContextWindow:    contextWindow,
+			PermissionModes:  permissionModes,
+		}
+		if qoderContextCount > 0 {
+			metrics.ContextRatioAvg = qoderContextSum / float64(qoderContextCount)
+		}
+		if contextWindow > 0 && qoderContextPeak > 0 {
+			metrics.EstimatedContextTokens = int(math.Round(qoderContextPeak * float64(contextWindow)))
+		}
+		if stats != nil {
+			metrics.PermissionRequests = stats.permissionRequests
+			metrics.PermissionAllowed = stats.permissionAllowed
+			metrics.PermissionDenied = stats.permissionDenied
+			if len(stats.permissionSources) > 0 {
+				metrics.PermissionSources = stats.permissionSources
+			}
+			metrics.ToolSuccess = stats.toolSuccess
+			metrics.ToolErrors = stats.toolErrors
+			metrics.ToolDenied = stats.toolDenied
+			metrics.ShellFailures = stats.shellFailures
+			metrics.ShellAborted = stats.shellAborted
+			metrics.Turns = stats.turns
+			metrics.TurnsAborted = stats.turnsAborted
+			metrics.Compactions = stats.compactions
+			metrics.Subagents = stats.subagents
+		}
+		session.Qoder = metrics
+	}
 
 	if len(session.Messages) == 0 {
 		return SyncSession{}, false
@@ -7659,6 +7933,26 @@ func intFrom(value any, fallback int) int {
 		}
 		if i, err := json.Number(v).Int64(); err == nil {
 			return int(i)
+		}
+	}
+	return fallback
+}
+
+func floatFrom(value any, fallback float64) float64 {
+	switch v := value.(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return f
 		}
 	}
 	return fallback
